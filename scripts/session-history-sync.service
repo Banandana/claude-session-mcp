@@ -1,0 +1,17 @@
+[Unit]
+Description=session-history-mcp — index new agent sessions (claude, pi, codex, opencode)
+Documentation=file:%h/workspace/research/agent-systems/grid/repos/session-history-mcp/docs/multi-source-plan.md
+After=network.target
+
+[Service]
+Type=oneshot
+# Codex and opencode have no hook into any agent's lifecycle, so a timer is the
+# only source-agnostic way to keep the index warm. The CLI is idempotent and
+# cheap when nothing changed.
+WorkingDirectory=%h/workspace/research/agent-systems/grid/repos/session-history-mcp
+ExecStart=/usr/bin/env npx tsx src/cli/sync.ts
+# Never let indexing compete with real work on this box.
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=50%
+TimeoutStartSec=600
