@@ -65,8 +65,11 @@ Large tool outputs spill to `~/.local/share/opencode/tool-output/<callID>`.
    per-source tool taxonomy. Plus the removals and the P0–P2 bug fixes.
 2. **CodexAdapter** — `src/adapters/codex/`.
 3. **OpencodeAdapter** — `src/adapters/opencode/`, opened read-only.
-4. **Automatic import** — systemd user timer over `src/cli/sync.ts`,
-   incremental parse resume from the stored watermark.
+4. **Automatic import** — incremental parse resume from the stored watermark.
+   A systemd user timer over `src/cli/sync.ts` was written and then dropped:
+   `ensureFresh()` runs on every tool call regardless, so a timer only helps
+   for sessions that fall quiet between runs and does nothing for one still
+   being written — which is the case that actually costs. Resume is the fix.
 5. **Cross-source features** — `source` filters, merged `list_projects`.
 
 ## Rules for every change
