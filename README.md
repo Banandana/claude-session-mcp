@@ -96,15 +96,32 @@ Add to your MCP configuration (`~/.claude.json`):
 {
   "mcpServers": {
     "session-history": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/session-history-mcp/src/server.ts"]
+      "command": "/path/to/session-history-mcp/scripts/mcp-server.sh"
     }
   }
 }
 ```
 
+Register the launcher, not `tsx src/server.ts` directly. An MCP client spawns
+its servers with the client's working directory, and `tsx` resolves
+`tsconfig.json` from the cwd — so a bare `tsx /path/to/src/server.ts` starts
+without this repo's `experimentalDecorators` and dies on the first inversify
+parameter decorator, before it speaks any protocol. The launcher pins the
+tsconfig so startup does not depend on where it was invoked from.
+
+Run `npm install` in the repo first: the launcher prefers the local `tsx` and
+the server needs its dependencies present either way.
+
 ```bash
 npm install    # Install dependencies
 npm run dev    # Hot-reload development server
 npm test       # Run tests
+```
+
+The index is built on demand, and the first build is a full parse of every
+transcript on the machine — minutes, not seconds. Seed it once out of band so
+the first tool call is an incremental refresh rather than a cold build:
+
+```bash
+npx tsx src/cli/sync.ts
 ```

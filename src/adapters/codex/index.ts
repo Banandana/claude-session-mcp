@@ -21,6 +21,7 @@ import { CodexMetadataParser } from './metadata-parser'
 import { CodexMemoryReader } from './memory-reader'
 import { CodexSubagentParser } from './subagent-parser'
 import { CodexSessionNotFoundError, CodexSessionReadError, type CodexAdapterError } from './errors'
+import { listAllRollouts, readRolloutHeader } from './rollout-header'
 
 export { CodexSessionDiscovery } from './session-discovery'
 export { CodexConversationParser } from './conversation-parser'
@@ -153,16 +154,24 @@ export class CodexAdapter implements SessionAdapter {
       return { isStale: false, newSessions: [], changedSessions: [], removedSessions: [] }
     }
 
-    for await (const session of this.discovery.discoverSessions()) {
-      seenIds.add(session.id)
-      const found = await this.discovery.findSessionFile(session.id)
-      if (!found) continue
-      const currentWatermark = await fileSize(found.path)
-      const knownWatermark = known.sessionWatermarks.get(session.id)
+    // One pass over the rollout tree, reading each header exactly once. The
+    // obvious spelling — iterate discoverSessions(), then findSessionFile()
+    // each id — is quadratic: discoverSessions() reads all N headers, and
+    // every findSessionFile() re-walks the tree reading them all again. At
+    // 123 rollouts / 38 sessions that measured 19.0s per freshness cycle,
+    // against 1.1s for a single pass, and freshness runs on every tool call.
+    // Each rollout already knows its own path, so nothing needs looking up.
+    for await (const { path } of listAllRollouts(sessionsDir)) {
+      const header = await readRolloutHeader(path)
+      if (!header) continue
+      if (header.threadSpawn) continue // sub-agent threads aren't sessions
+      seenIds.add(header.sessionId)
+      const currentWatermark = await fileSize(path)
+      const knownWatermark = known.sessionWatermarks.get(header.sessionId)
       if (knownWatermark === undefined) {
-        newSessions.push(session.id)
+        newSessions.push(header.sessionId)
       } else if (currentWatermark > knownWatermark) {
-        changedSessions.push(session.id)
+        changedSessions.push(header.sessionId)
       }
     }
 

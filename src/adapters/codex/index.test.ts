@@ -1,7 +1,23 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { join } from 'node:path'
 import { CodexAdapter } from './index'
+import { listAllRollouts } from './rollout-header'
 import type { NormalizedMessage, SessionMeta } from '../../types'
+
+// Counts real readRolloutHeader calls without changing what it returns, so
+// the "at most once per rollout" scan-shape assertion below has something to
+// measure.
+const headerReads = vi.hoisted(() => ({ count: 0 }))
+vi.mock('./rollout-header', async () => {
+  const actual = await vi.importActual<typeof import('./rollout-header')>('./rollout-header')
+  return {
+    ...actual,
+    readRolloutHeader: async (path: string) => {
+      headerReads.count++
+      return actual.readRolloutHeader(path)
+    },
+  }
+})
 
 const CODEX_HOME = join(__dirname, '../../../fixtures/codex-home')
 const PARENT_ID = '01a00000-0000-7000-8000-000000000001'
@@ -64,6 +80,25 @@ describe('CodexAdapter', () => {
     expect(result.newSessions).toEqual([PARENT_ID])
     expect(result.changedSessions).toEqual([])
     expect(result.removedSessions).toEqual([])
+  })
+
+  it('checkFreshness reads each rollout header at most once', async () => {
+    // Guards the shape of the scan, not a wall-clock number. The previous
+    // implementation walked the tree once per discovered session
+    // (discoverSessions, then findSessionFile per id), which is quadratic in
+    // rollout count and measured 19.0s against 1.1s for a single pass on a
+    // real 123-rollout store — paid on every tool call, since freshness runs
+    // per call. Reading a header more than once per file means that walk is
+    // back.
+    let rollouts = 0
+    for await (const _ of listAllRollouts(join(CODEX_HOME, 'sessions'))) rollouts++
+    expect(rollouts).toBeGreaterThan(1)
+
+    headerReads.count = 0
+    const adapter = new CodexAdapter(CODEX_HOME)
+    await adapter.checkFreshness({ sessionWatermarks: new Map(), lastSyncAt: new Date(0).toISOString() })
+
+    expect(headerReads.count).toBeLessThanOrEqual(rollouts)
   })
 
   describe('missing ~/.codex/sessions directory', () => {
