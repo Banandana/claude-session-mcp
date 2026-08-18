@@ -14,7 +14,7 @@ import { TokenBudgetManager } from '../services/token-budget-manager'
 import { PaginationManager } from '../services/pagination-manager'
 
 import { LocalLlmClient } from '../services/local-llm-client'
-import { createLlmClient, OpenAiLlmClient } from '../services/llm-client'
+import { OpenAiLlmClient } from '../services/llm-client'
 import { ProjectResolver } from '../services/project-resolver'
 import { Analyzer } from '../services/analyzer'
 import { ResponseFormatter } from '../services/response-formatter'
@@ -86,13 +86,21 @@ export function registerInfrastructure(): void {
   const turnIndexer = new TurnIndexer(db)
   container.bind<TurnIndexer>(TOKENS.TurnIndexer).toConstantValue(turnIndexer)
 
-  // LLM clients — local only. LocalLlmClient is the legacy summarization
-  // helper used by FreshnessGuard; OpenAiLlmClient is the general-purpose
-  // backend bound under TOKENS.LlmClient.
-  const llmClient = new LocalLlmClient(localLlmUrl, localLlmModelFallback)
-  container.bind<LocalLlmClient>(TOKENS.LocalLlmClient).toConstantValue(llmClient)
-  const openAiLlmClient = createLlmClient(localLlmUrl, localLlmModelFallback)
-  container.bind<OpenAiLlmClient>(TOKENS.LlmClient).toConstantValue(openAiLlmClient)
+  // Background session summarization is OPT-IN via ENABLE_LLM_SUMMARIES.
+  //
+  // FreshnessGuard fires generateSummaries() on every ensureFresh() cycle, and
+  // ensureFresh() runs on every MCP tool call and every sync-timer tick. That
+  // points a steady trickle of inference at LOCAL_LLM_URL, which on a machine
+  // that also serves real workloads means competing with them for the GPU.
+  // Off by default: when the client is never constructed, the guard's
+  // `if (!this.llmClient) return` makes summarization a no-op, and nothing
+  // reaches the network.
+  const summariesEnabled = process.env['ENABLE_LLM_SUMMARIES'] === '1'
+    || process.env['ENABLE_LLM_SUMMARIES'] === 'true'
+  const llmClient = summariesEnabled
+    ? new LocalLlmClient(localLlmUrl, localLlmModelFallback)
+    : undefined
+  if (llmClient) container.bind<LocalLlmClient>(TOKENS.LocalLlmClient).toConstantValue(llmClient)
 
   // Services
   const tokenBudget = new TokenBudgetManager()
