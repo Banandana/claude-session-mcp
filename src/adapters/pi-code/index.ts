@@ -57,8 +57,11 @@ export class PiCodeAdapter implements SessionAdapter {
   }
 
   async *discoverProjects(): AsyncIterable<ProjectMeta> {
+    // buildProjectCache() already walks the full sessions dir to populate
+    // the cache — yield from that cache instead of re-walking disk a
+    // second time (finding B11, second half).
     await this.discovery.buildProjectCache()
-    yield* this.discovery.discoverProjects()
+    yield* this.discovery.cachedProjects()
   }
 
   async *discoverSessions(project?: string): AsyncIterable<SessionMeta> {
@@ -116,7 +119,7 @@ export class PiCodeAdapter implements SessionAdapter {
   }
 
   async resolveProject(path: string): Promise<ProjectMeta | undefined> {
-    return this.discovery.resolveProject(path)
+    return await this.discovery.resolveProject(path)
   }
 
   async checkFreshness(known: IndexState): Promise<FreshnessResult> {
@@ -135,18 +138,18 @@ export class PiCodeAdapter implements SessionAdapter {
       seenIds.add(session.id)
       const found = await this.discovery.findSessionFile(session.id)
       if (!found) continue
-      const currentSize = await fileSize(found.path)
-      const knownOffset = known.sessionOffsets.get(session.id)
-      if (knownOffset === undefined) {
+      const currentWatermark = await fileSize(found.path)
+      const knownWatermark = known.sessionWatermarks.get(session.id)
+      if (knownWatermark === undefined) {
         newSessions.push(session.id)
-      } else if (currentSize > knownOffset) {
+      } else if (currentWatermark > knownWatermark) {
         changedSessions.push(session.id)
       }
     }
 
-    // Registry pre-filters `known.sessionOffsets` to ids this adapter claims,
-    // so any known id we don't see on disk really is gone.
-    for (const knownId of known.sessionOffsets.keys()) {
+    // Registry pre-filters `known.sessionWatermarks` to ids this adapter
+    // claims, so any known id we don't see on disk really is gone.
+    for (const knownId of known.sessionWatermarks.keys()) {
       if (!seenIds.has(knownId)) {
         removedSessions.push(knownId)
       }
@@ -165,7 +168,7 @@ export class PiCodeAdapter implements SessionAdapter {
     return found !== undefined
   }
 
-  async getSessionSize(sessionId: string): Promise<number | undefined> {
+  async getSessionWatermark(sessionId: string): Promise<number | undefined> {
     const found = await this.discovery.findSessionFile(sessionId)
     if (!found) return undefined
     return fileSize(found.path)

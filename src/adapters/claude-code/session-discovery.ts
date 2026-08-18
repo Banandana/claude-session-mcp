@@ -215,4 +215,13 @@ export class SessionDiscovery {
     }
     this.cacheBuilt = true
   }
+
+  /**
+   * Snapshot of the cache built by the most recent buildProjectCache() call
+   * — lets callers that already paid for a full disk walk avoid paying for
+   * a second one just to enumerate the same projects (finding B11).
+   */
+  cachedProjects(): readonly ProjectMeta[] {
+    return [...this.projectCache.values()]
+  }
 }

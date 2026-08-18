@@ -29,6 +29,7 @@ export function extractSessionIdFromFilename(filename: string): string | undefin
 
 export class PiSessionDiscovery {
   private projectCache: Map<string, ProjectMeta> = new Map()
+  private cacheBuilt = false
 
   constructor(private readonly piDir: string) {}
 
@@ -95,7 +96,23 @@ export class PiSessionDiscovery {
     }
   }
 
-  resolveProject(path: string): ProjectMeta | undefined {
+  /**
+   * Async because a fresh process may need to build the cache first.
+   * Before this fix (finding B10), resolveProject read a cache that was
+   * only ever populated by buildProjectCache() — which nothing called on
+   * a cold `path:`-scoped MCP tool invocation, so resolution always
+   * returned undefined. Mirrors the lazy-build pattern in claude-code's
+   * SessionDiscovery.resolveProject.
+   */
+  async resolveProject(path: string): Promise<ProjectMeta | undefined> {
+    if (!this.cacheBuilt) {
+      await this.buildProjectCache()
+    }
+    return this.lookupCached(path)
+  }
+
+  /** Sync lookup that assumes the cache is already built. */
+  private lookupCached(path: string): ProjectMeta | undefined {
     let current = path
     while (current && current !== '/') {
       const slug = '--' + current.slice(1).replace(/\//g, '-') + '--'
@@ -112,6 +129,17 @@ export class PiSessionDiscovery {
     for await (const project of this.discoverProjects()) {
       this.projectCache.set(project.slug, project)
     }
+    this.cacheBuilt = true
+  }
+
+  /**
+   * Snapshot of the cache built by the most recent buildProjectCache()
+   * call — lets callers that already paid for a full disk walk avoid
+   * paying for a second one just to enumerate the same projects
+   * (finding B11).
+   */
+  cachedProjects(): readonly ProjectMeta[] {
+    return [...this.projectCache.values()]
   }
 
   /**

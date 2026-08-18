@@ -87,11 +87,16 @@ export class FreshnessGuard {
     this.indexManager.ensureSchema()
 
     // 2. Build IndexState from current database (single query, not N+1)
-    const offsets = this.indexManager.getAllSessionOffsets()
+    const watermarks = this.indexManager.getAllSessionWatermarks()
     const known: IndexState = {
-      sessionOffsets: offsets,
+      sessionWatermarks: watermarks,
       lastSyncAt: new Date().toISOString(),
     }
+
+    // 2b. Supply DB-backed ownership hints so the registry can resolve a
+    // session's owning adapter straight from `sessions.source` instead of
+    // probing every adapter's disk layout per session (finding B11).
+    this.registry.setOwnerHints(this.loadOwnerHints())
 
     // 3. Check freshness via adapter registry
     const result = await this.registry.checkFreshness(known)
@@ -197,8 +202,8 @@ export class FreshnessGuard {
     }
 
     const insertSession = this.db.prepare(`
-      INSERT OR REPLACE INTO sessions (id, source, project_slug, cwd, branch, started_at, model, total_tokens, total_turns, summary_text, byte_offset, indexed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO sessions (id, source, project_slug, project_id, cwd, branch, started_at, model, total_tokens, total_turns, summary_text, byte_offset, indexed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     const insertMessage = this.db.prepare(`
@@ -231,11 +236,20 @@ export class FreshnessGuard {
 
       // Run all DB writes in a single transaction
       this.db.transaction(() => {
+        // Canonical project identity (migration V7) — resolved from cwd,
+        // additive alongside project_slug (other tool queries still use
+        // project_slug, so it's kept as-is).
+        let projectId: string | null = null
+        if (meta && meta.cwd) {
+          projectId = this.resolveProjectId(meta.cwd, meta.source, meta.projectSlug)
+        }
+
         // Insert session record
         insertSession.run(
           sessionId,
           meta?.source ?? 'claude-code',
           meta?.projectSlug ?? null,
+          projectId,
           meta?.cwd ?? null,
           meta?.branch ?? null,
           meta?.startedAt ?? null,
@@ -335,7 +349,7 @@ export class FreshnessGuard {
     }
 
     // Update offsets with real file sizes
-    await this.updateFileOffsets(sessionIds)
+    await this.updateWatermarks(sessionIds)
   }
 
   private async syncChangedSessions(sessionIds: readonly string[]): Promise<void> {
@@ -452,7 +466,7 @@ export class FreshnessGuard {
       this.turnIndexer?.indexSession(sessionId, messages)
     }
 
-    await this.updateFileOffsets(sessionIds)
+    await this.updateWatermarks(sessionIds)
   }
 
   private removeDeletedSessions(sessionIds: readonly string[]): void {
@@ -489,11 +503,19 @@ export class FreshnessGuard {
   }
 
   private computeSessionMetrics(sessionId: string, messages?: readonly NormalizedMessage[]): void {
-    // Get started_at from session row
+    // Get started_at (+ the fields needed to resolve project_id) from session row
     const sessionRow = this.db.prepare(
-      'SELECT started_at FROM sessions WHERE id = ?'
-    ).get(sessionId) as { started_at: string | null } | undefined
+      'SELECT started_at, source, project_slug, cwd, project_id FROM sessions WHERE id = ?'
+    ).get(sessionId) as { started_at: string | null; source: string; project_slug: string | null; cwd: string | null; project_id: string | null } | undefined
     const startedAt = sessionRow?.started_at ?? null
+
+    // Populate project_id (migration V7) whenever it's still unset — covers
+    // syncChangedSessions, which doesn't have a fresh SessionMeta to hand
+    // to the insert path the way syncNewSessions does.
+    if (sessionRow && sessionRow.cwd && !sessionRow.project_id) {
+      const projectId = this.resolveProjectId(sessionRow.cwd, sessionRow.source, sessionRow.project_slug ?? '')
+      this.db.prepare('UPDATE sessions SET project_id = ? WHERE id = ?').run(projectId, sessionId)
+    }
 
     // Message counts
     const msgStats = this.db.prepare(`
@@ -741,15 +763,46 @@ export class FreshnessGuard {
     return parts.join('\n')
   }
 
-  private async updateFileOffsets(sessionIds: readonly string[]): Promise<void> {
+  private async updateWatermarks(sessionIds: readonly string[]): Promise<void> {
     // Delegate to the registry — each adapter owns its on-disk layout.
     // (Claude-code: ~/.claude/projects/<slug>/<id>.jsonl. Pi-code: ~/.pi/agent/sessions/...).
-    // Without this, pi-code sessions stay at offset 0 and get re-indexed every cycle.
+    // Without this, pi-code sessions stay at watermark 0 and get re-indexed every cycle.
     for (const sessionId of sessionIds) {
-      const size = await this.registry.getSessionSize(sessionId)
-      if (size !== undefined) {
-        this.indexManager.updateSessionOffset(sessionId, size)
+      const watermark = await this.registry.getSessionWatermark(sessionId)
+      if (watermark !== undefined) {
+        this.indexManager.updateSessionWatermark(sessionId, watermark)
       }
     }
+  }
+
+  /** One `SELECT id, source FROM sessions` per cycle — see finding B11. */
+  private loadOwnerHints(): Map<string, string> {
+    const rows = this.db.prepare('SELECT id, source FROM sessions').all() as Array<{ id: string; source: string }>
+    const hints = new Map<string, string>()
+    for (const row of rows) hints.set(row.id, row.source)
+    return hints
+  }
+
+  /**
+   * Resolves (and lazily creates) the canonical project row for a
+   * session's real filesystem cwd, and records the (source, slug) ->
+   * project_id alias (migration V7 — canonical project identity).
+   *
+   * The canonical id IS the normalized path: stable across sources, since
+   * a claude slug (-home-kitty-foo), a pi slug (--home-kitty-foo--), an
+   * opencode sha1, and a bare Codex cwd can all describe the same
+   * directory and should collapse to the same project.
+   */
+  private resolveProjectId(cwd: string, source: string, sourceSlug: string): string {
+    const projectId = cwd.length > 1 && cwd.endsWith('/') ? cwd.slice(0, -1) : cwd
+    this.db.prepare(
+      'INSERT OR IGNORE INTO projects (id, path, first_seen_at) VALUES (?, ?, ?)'
+    ).run(projectId, projectId, new Date().toISOString())
+    if (sourceSlug) {
+      this.db.prepare(
+        'INSERT OR IGNORE INTO project_aliases (source, source_slug, project_id) VALUES (?, ?, ?)'
+      ).run(source, sourceSlug, projectId)
+    }
+    return projectId
   }
 }

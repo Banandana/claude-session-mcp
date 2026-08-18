@@ -146,6 +146,42 @@ export class IndexManager {
       })()
       this.db.pragma('user_version = 6')
     }
+    if (userVersion < 7) {
+      this.db.transaction(() => {
+        this.migrateToV7()
+      })()
+      this.db.pragma('user_version = 7')
+    }
+  }
+
+  private migrateToV7(): void {
+    // Canonical project identity: a `projects` table keyed on the real
+    // filesystem path, with a `project_aliases` table mapping each
+    // source's own slug encoding onto that canonical id. A claude slug
+    // (-home-kitty-foo), a pi slug (--home-kitty-foo--), an opencode sha1,
+    // and a bare Codex cwd can all describe the same directory — this is
+    // what lets "show me everything that touched this repo" work across
+    // sources. `project_slug` on `sessions` is kept as-is (additive) —
+    // other tool queries still use it.
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        path TEXT NOT NULL,
+        first_seen_at TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS project_aliases (
+        source TEXT NOT NULL,
+        source_slug TEXT NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+        PRIMARY KEY (source, source_slug)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_project_aliases_project_id ON project_aliases(project_id);
+    `)
+
+    this.addColumnIfMissing('sessions', 'project_id', 'TEXT')
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_project_id ON sessions(project_id)`)
   }
 
   private migrateToV6(): void {
@@ -331,7 +367,14 @@ export class IndexManager {
     this.db.exec(`UPDATE sessions SET byte_offset = 0`)
   }
 
-  getSessionOffset(sessionId: string): number {
+  /**
+   * The stored watermark for a session — an opaque, monotonically-
+   * increasing integer an adapter uses to detect change (byte size for
+   * file-backed sources, `time_updated` for DB-backed ones). The column
+   * is still named `byte_offset` in SQL (no migration needed — same
+   * INTEGER type, just a naming/contract change at the TS layer).
+   */
+  getSessionWatermark(sessionId: string): number {
     const row = this.db.prepare(
       'SELECT byte_offset FROM sessions WHERE id = ?'
     ).get(sessionId) as { byte_offset: number } | undefined
@@ -339,7 +382,7 @@ export class IndexManager {
     return row?.byte_offset ?? 0
   }
 
-  getAllSessionOffsets(): Map<string, number> {
+  getAllSessionWatermarks(): Map<string, number> {
     const rows = this.db.prepare(
       'SELECT id, byte_offset FROM sessions'
     ).all() as { id: string; byte_offset: number }[]
@@ -348,10 +391,10 @@ export class IndexManager {
     return out
   }
 
-  updateSessionOffset(sessionId: string, offset: number): void {
+  updateSessionWatermark(sessionId: string, watermark: number): void {
     this.db.prepare(
       'UPDATE sessions SET byte_offset = ? WHERE id = ?'
-    ).run(offset, sessionId)
+    ).run(watermark, sessionId)
   }
 
   getKnownSessionIds(): Set<string> {

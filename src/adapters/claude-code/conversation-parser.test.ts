@@ -99,17 +99,45 @@ describe('ConversationParser', () => {
       expect(msg5.toolNames).toEqual(['Read'])
     })
 
-    it('propagates tool name for stderr errors too', async () => {
+    it('propagates tool name regardless of error status', async () => {
       const messages = await collectMessages(parser, sessionPath)
       const msg7 = messages.find(m => m.uuid === 'dd-msg-7')!
-      expect(msg7.isError).toBe(true)
       expect(msg7.toolNames).toEqual(['Bash'])
+    })
+
+    // Regression test for finding B1: dd-msg-7's tool_result carries a
+    // non-empty stderr but NO explicit is_error flag. The old heuristic
+    // treated any non-empty stderr as an error; the fix requires an
+    // explicit signal from the source. Updated from the old expectation of
+    // `true` (see git history) — that expectation encoded the bug.
+    it('does NOT flag a tool result as an error from stderr alone (finding B1)', async () => {
+      const messages = await collectMessages(parser, sessionPath)
+      const msg7 = messages.find(m => m.uuid === 'dd-msg-7')!
+      expect(msg7.isError).toBe(false)
     })
 
     it('does not set toolNames on non-tool-result user messages', async () => {
       const messages = await collectMessages(parser, sessionPath)
       const msg1 = messages.find(m => m.uuid === 'dd-msg-1')!
       expect(msg1.toolNames).toBeUndefined()
+    })
+  })
+
+  describe('per-block isError (finding B17)', () => {
+    const sessionPath = join(FIXTURES, 'dddddddd-1111-2222-3333-444444444444.jsonl')
+
+    it('sets isError=true on the tool_result block with an explicit is_error flag', async () => {
+      const messages = await collectMessages(parser, sessionPath)
+      const msg5 = messages.find(m => m.uuid === 'dd-msg-5')!
+      const block = msg5.contentBlocks.find(b => b.type === 'tool_result')!
+      expect(block.isError).toBe(true)
+    })
+
+    it('sets isError=false on a tool_result block with no explicit flag, even with stderr', async () => {
+      const messages = await collectMessages(parser, sessionPath)
+      const msg7 = messages.find(m => m.uuid === 'dd-msg-7')!
+      const block = msg7.contentBlocks.find(b => b.type === 'tool_result')!
+      expect(block.isError).toBe(false)
     })
   })
 
