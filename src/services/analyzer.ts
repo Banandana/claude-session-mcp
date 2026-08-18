@@ -132,10 +132,16 @@ export class Analyzer {
     const limit = options?.limit ?? 10
     const params: (string | number)[] = []
 
+    // tool_names is a comma-joined (or JSON-array) string per turn, so a
+    // turn that ran e.g. Bash and Read must count toward BOTH tools'
+    // failure totals, not form its own "Bash,Read" bucket. json_each over
+    // a normalized JSON-array form of the column does the split; same
+    // idiom as ContextAuditor's per-tool breakdowns.
     let sql = `
-      SELECT m.tool_names, COUNT(*) as failure_count
+      SELECT tool_name.value AS tool_name, COUNT(*) as failure_count
       FROM messages m
       JOIN sessions s ON m.session_id = s.id
+      , json_each(CASE WHEN m.tool_names LIKE '[%' THEN m.tool_names ELSE '["' || replace(m.tool_names, ',', '","') || '"]' END) AS tool_name
     `
 
     sql += ` WHERE m.is_error = 1 AND m.tool_names IS NOT NULL`
@@ -155,18 +161,18 @@ export class Analyzer {
       params.push(options.dateRange.to)
     }
 
-    sql += ` GROUP BY m.tool_names ORDER BY failure_count DESC LIMIT ?`
+    sql += ` GROUP BY tool_name.value ORDER BY failure_count DESC LIMIT ?`
     params.push(limit)
 
     const rows = this.db.prepare(sql).all(...params) as Array<{
-      tool_names: string
+      tool_name: string
       failure_count: number
     }>
 
     return rows.map(row => ({
-      label: row.tool_names,
+      label: row.tool_name,
       count: row.failure_count,
-      details: row.tool_names,
+      details: row.tool_name,
     }))
   }
 

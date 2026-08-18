@@ -31,6 +31,34 @@ describe('truncateBlocks', () => {
     const toolUse = result.blocks.find(b => b.type === 'tool_use')
     expect(toolUse?.input).toEqual({ _truncated: true })
   })
+
+  it('counts thinking block tokens toward the budget (regression: thinking was invisible to estimateBlockTokens)', () => {
+    // Before the fix, estimateBlockTokens only looked at text/input/content,
+    // so a turn made entirely of a large thinking block was estimated at 0
+    // tokens and truncateBlocks returned it completely untouched.
+    const blocks: ContentBlock[] = [
+      { type: 'thinking', thinking: 'x'.repeat(2000) },
+    ]
+    const result = truncateBlocks(blocks, 100)
+    expect(result.truncated).toBe(true)
+    const thinkingBlock = result.blocks.find(b => b.type === 'thinking')
+    expect(typeof thinkingBlock?.thinking === 'string' && thinkingBlock.thinking.length).toBeLessThan(2000)
+  })
+
+  it('truncates thinking blocks before text blocks (reasoning is least load-bearing)', () => {
+    const blocks: ContentBlock[] = [
+      { type: 'thinking', thinking: 'x'.repeat(4000) },
+      { type: 'text', text: 'y'.repeat(40) },
+    ]
+    const result = truncateBlocks(blocks, 20)
+    expect(result.truncated).toBe(true)
+    const thinkingBlock = result.blocks.find(b => b.type === 'thinking')
+    const textBlock = result.blocks.find(b => b.type === 'text')
+    expect(typeof thinkingBlock?.thinking === 'string' && thinkingBlock.thinking.length).toBeLessThan(4000)
+    // Truncating the thinking block alone was enough to fit the budget, so
+    // the text block — checked in a later pass — is untouched.
+    expect(textBlock?.text).toBe('y'.repeat(40))
+  })
 })
 
 describe('truncateTurns', () => {

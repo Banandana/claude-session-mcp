@@ -40,11 +40,24 @@ export function registerSearch(server: McpServer): void {
         ? { from: params.from, to: params.to }
         : undefined
 
+      // Decode the cursor up front and fail with a clear error on garbage
+      // input — a cursor minted by a DIFFERENT tool (or corrupted) must not
+      // silently restart search at page 1.
+      let paginationOffset = 0
+      if (params.cursor) {
+        const decoded = pagination.decodeCursor(params.cursor)
+        if (decoded === undefined) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              error: `Invalid pagination cursor: ${params.cursor}`,
+            }, null, 2) }],
+          }
+        }
+        paginationOffset = decoded
+      }
+
       // Pass offset + limit + 1 to SQL so pagination can detect hasMore,
       // but let the pagination layer handle actual slicing.
-      const paginationOffset = params.cursor
-        ? pagination.decodeCursor(params.cursor)
-        : 0
       const limit = params.maxResults ?? 50
       const results = searchIndex.search(params.query, {
         projectSlug,
@@ -56,6 +69,7 @@ export function registerSearch(server: McpServer): void {
       const total = searchIndex.searchCount(params.query, {
         ...(projectSlug !== undefined ? { projectSlug } : {}),
         ...(params.sessionId !== undefined ? { sessionId: params.sessionId } : {}),
+        ...(dateRange !== undefined ? { dateRange } : {}),
       })
 
       const page = pagination.paginate(results, {

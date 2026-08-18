@@ -8,6 +8,7 @@ import type { DatabaseConnection } from '../infrastructure/database'
 import type { AdapterRegistry } from '../services/adapter-registry'
 import type { NormalizedMessage, ContentBlock } from '../types'
 import type { ExpandedTurn } from '../types/conversation'
+import { isValidSessionId } from './shared/session-id'
 
 export type { ExpandedTurn }
 
@@ -20,10 +21,11 @@ function estimateBlockTokens(block: ContentBlock): number {
   if (block.text) chars += block.text.length
   if (block.input) chars += JSON.stringify(block.input).length
   if (block.content) chars += typeof block.content === 'string' ? block.content.length : JSON.stringify(block.content).length
+  if (block.thinking) chars += block.thinking.length
   return Math.ceil(chars / CHARS_PER_TOKEN)
 }
 
-function truncateBlock(block: ContentBlock, field: 'content' | 'input' | 'text', maxChars: number): ContentBlock {
+function truncateBlock(block: ContentBlock, field: 'content' | 'input' | 'text' | 'thinking', maxChars: number): ContentBlock {
   if (field === 'content' && typeof block.content === 'string' && block.content.length > maxChars) {
     return { ...block, content: block.content.slice(0, maxChars) + '\n[truncated]' }
   }
@@ -32,6 +34,9 @@ function truncateBlock(block: ContentBlock, field: 'content' | 'input' | 'text',
   }
   if (field === 'text' && block.text && block.text.length > maxChars) {
     return { ...block, text: block.text.slice(0, maxChars) + '\n[truncated]' }
+  }
+  if (field === 'thinking' && block.thinking && block.thinking.length > maxChars) {
+    return { ...block, thinking: block.thinking.slice(0, maxChars) + '\n[truncated]' }
   }
   return block
 }
@@ -44,7 +49,7 @@ export function truncateBlocks(blocks: readonly ContentBlock[], maxTokens: numbe
 
   const truncatePass = (
     filter: (b: ContentBlock) => boolean,
-    field: 'content' | 'input' | 'text',
+    field: 'content' | 'input' | 'text' | 'thinking',
   ): void => {
     const indices = result
       .map((b, i) => ({ block: b, idx: i }))
@@ -67,7 +72,10 @@ export function truncateBlocks(blocks: readonly ContentBlock[], maxTokens: numbe
   truncatePass(b => b.type === 'tool_result' && b.content !== undefined, 'content')
   // Pass 2: truncate tool_use input
   if (totalTokens > maxTokens) truncatePass(b => b.type === 'tool_use' && b.input !== undefined, 'input')
-  // Pass 3: truncate text blocks
+  // Pass 3: truncate thinking blocks — reasoning is the least load-bearing
+  // content in an expansion, so it goes before text.
+  if (totalTokens > maxTokens) truncatePass(b => b.type === 'thinking' && b.thinking !== undefined, 'thinking')
+  // Pass 4: truncate text blocks
   if (totalTokens > maxTokens) truncatePass(b => b.type === 'text' && b.text !== undefined, 'text')
 
   return { blocks: result, truncated: true }
@@ -82,7 +90,7 @@ export function truncateTurns(turns: readonly ExpandedTurn[], maxTokens: number)
     return { ...turn, contentBlocks: blockResult.blocks }
   })
 
-  // Pass 4: drop middle turns if still over budget
+  // Pass 5: drop middle turns if still over budget
   const estimateTotal = () => result.reduce((sum, t) =>
     sum + t.contentBlocks.reduce((s, b) => s + estimateBlockTokens(b), 0), 0)
 
@@ -126,10 +134,6 @@ function messageToExpandedTurn(msg: NormalizedMessage, turnIndex: number, includ
 }
 
 // --- Tool registration ---
-
-function validateSessionId(id: string): boolean {
-  return /^[a-f0-9-]{32,40}$/i.test(id)
-}
 
 interface SessionRow {
   readonly project_slug: string | null
@@ -186,7 +190,7 @@ export function registerGetTurns(server: McpServer): void {
 
       const freshness = await freshnessGuard.ensureFresh()
 
-      if (!validateSessionId(params.sessionId)) {
+      if (!isValidSessionId(params.sessionId)) {
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ error: `Invalid session ID format: ${params.sessionId}` }, null, 2) }],
         }

@@ -191,6 +191,19 @@ describe('SearchIndex', () => {
     expect(searchIndex.searchCount('')).toBe(0)
   })
 
+  it('searchCount respects dateRange (regression: totalEstimate ignored the date filter search() used)', () => {
+    // 'database' matches msg-3 (11:00:01), msg-4 (11:00:05), and msg-5
+    // (10:05:00). Restricting to 10:30-12:00 excludes msg-5, leaving only
+    // session-2's two messages.
+    const dateRange = { from: '2026-03-28T10:30:00Z', to: '2026-03-28T12:00:00Z' }
+    const filteredResults = searchIndex.search('database', { dateRange })
+    const filteredCount = searchIndex.searchCount('database', { dateRange })
+    const unfilteredCount = searchIndex.searchCount('database')
+
+    expect(filteredCount).toBe(filteredResults.length)
+    expect(filteredCount).toBeLessThan(unfilteredCount)
+  })
+
   it('returns projectSlug in results', () => {
     const results = searchIndex.search('authentication')
     expect(results.length).toBeGreaterThan(0)

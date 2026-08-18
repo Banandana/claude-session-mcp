@@ -5,6 +5,7 @@ import { TOKENS } from '../container/tokens'
 import type { AdapterRegistry } from '../services/adapter-registry'
 import type { ProjectResolver } from '../services/project-resolver'
 import type { ResponseFormatter } from '../services/response-formatter'
+import type { FreshnessGuard } from '../services/freshness-guard'
 import type { MemoryEntry } from '../types'
 
 export function registerGetMemory(server: McpServer): void {
@@ -21,6 +22,9 @@ export function registerGetMemory(server: McpServer): void {
       const registry = container.get<AdapterRegistry>(TOKENS.AdapterRegistry)
       const projectResolver = container.get<ProjectResolver>(TOKENS.ProjectResolver)
       const formatter = container.get<ResponseFormatter>(TOKENS.ResponseFormatter)
+      const freshnessGuard = container.get<FreshnessGuard>(TOKENS.FreshnessGuard)
+
+      const freshness = await freshnessGuard.ensureFresh()
 
       const projectSlug = await projectResolver.resolveProjectFilter({
         project: params.project,
@@ -41,12 +45,7 @@ export function registerGetMemory(server: McpServer): void {
         entries = entries.filter(e => e.content.toLowerCase().includes(searchLower))
       }
 
-      const meta = {
-        indexedAt: new Date().toISOString(),
-        sessionCount: 0,
-        staleSessions: 0,
-        syncDurationMs: 0,
-      }
+      const meta = formatter.formatMeta(freshness)
 
       const response = formatter.format(entries, meta)
 

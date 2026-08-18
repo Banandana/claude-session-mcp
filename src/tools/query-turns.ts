@@ -10,6 +10,8 @@ import type { AdapterRegistry } from '../services/adapter-registry'
 import type { NormalizedMessage, ContentBlock, MessageRole } from '../types'
 import type { TurnReference } from '../types/conversation'
 import { extractToolParams } from '../services/tool-summary'
+import type { PaginationManager } from '../services/pagination-manager'
+import { isValidSessionId } from './shared/session-id'
 import type Database from 'better-sqlite3'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -49,10 +51,6 @@ interface TurnEventRow {
   readonly is_error: number
   readonly is_correction: number
   readonly text_preview: string | null
-}
-
-function validateSessionId(id: string): boolean {
-  return /^[a-f0-9-]{32,40}$/i.test(id)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -261,7 +259,14 @@ async function ensureTurnEventsIndexed(
   const turnIndexer = container.get<TurnIndexer>(TOKENS.TurnIndexer)
 
   for (const session of unindexed) {
-    if (!validateSessionId(session.id)) continue
+    // A malformed id is skipped with a visible reason, not silently dropped —
+    // silently continuing here previously meant a fully-indexed cross-session
+    // query_turns could hand back an EMPTY result set for a source whose ids
+    // don't happen to look like Claude UUIDs.
+    if (!isValidSessionId(session.id)) {
+      console.warn(`[query_turns] skipping turn-event indexing for session "${session.id}": invalid session id`)
+      continue
+    }
 
     try {
       const messages: NormalizedMessage[] = []
@@ -393,6 +398,7 @@ export function registerQueryTurns(server: McpServer): void {
       const dbConn = container.get<DatabaseConnection>(TOKENS.Database)
       const db = dbConn.get()
       const registry = container.get<AdapterRegistry>(TOKENS.AdapterRegistry)
+      const pagination = container.get<PaginationManager>(TOKENS.PaginationManager)
 
       // Validate constraints
       if (!params.sessionId && !params.projectId) {
@@ -421,7 +427,7 @@ export function registerQueryTurns(server: McpServer): void {
 
       // Validate sessionId format BEFORE the DB lookup so a malformed id
       // surfaces as an error instead of silently returning empty results.
-      if (params.sessionId && !validateSessionId(params.sessionId)) {
+      if (params.sessionId && !isValidSessionId(params.sessionId)) {
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({
             error: `Invalid session ID format: ${params.sessionId}`,
@@ -444,10 +450,25 @@ export function registerQueryTurns(server: McpServer): void {
         }
       }
 
+      // Decode the cursor with the same PaginationManager every other tool
+      // uses (base64url `{"o":n}`) instead of a bare integer string — a
+      // cursor minted by search/list_sessions/get_changes/semantic_search
+      // must not silently restart query_turns at page 1.
+      let offset = 0
+      if (params.cursor) {
+        const decoded = pagination.decodeCursor(params.cursor)
+        if (decoded === undefined) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              error: `Invalid pagination cursor: ${params.cursor}`,
+            }, null, 2) }],
+          }
+        }
+        offset = decoded
+      }
+
       const freshness = await freshnessGuard.ensureFresh()
       const limit = params.limit ?? 50
-      const rawOffset = params.cursor ? parseInt(params.cursor, 10) : 0
-      const offset = isNaN(rawOffset) || rawOffset < 0 ? 0 : rawOffset
 
       const filters: TurnFilters = {
         toolNames: params.toolNames,
@@ -481,7 +502,7 @@ export function registerQueryTurns(server: McpServer): void {
       }
 
       const hasMore = offset + results.length < total
-      const nextCursor = hasMore ? String(offset + results.length) : undefined
+      const nextCursor = hasMore ? pagination.encodeCursor(offset + results.length) : undefined
 
       const shapedResults = params.compact
         ? results.map(r => ({

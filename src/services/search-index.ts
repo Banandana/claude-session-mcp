@@ -193,7 +193,7 @@ export class SearchIndex {
     })
   }
 
-  searchCount(query: string, options?: { projectSlug?: string; sessionId?: string }): number {
+  searchCount(query: string, options?: { projectSlug?: string; sessionId?: string; dateRange?: DateRange }): number {
     if (!query.trim()) return 0
 
     const safeQuery = sanitizeFtsQuery(query)
@@ -210,6 +210,16 @@ export class SearchIndex {
     if (options?.sessionId) {
       conditions.push('m.session_id = ?')
       params.push(options.sessionId)
+    }
+
+    if (options?.dateRange?.from) {
+      conditions.push('m.timestamp >= ?')
+      params.push(options.dateRange.from)
+    }
+
+    if (options?.dateRange?.to) {
+      conditions.push('m.timestamp <= ?')
+      params.push(options.dateRange.to)
     }
 
     const sql = `

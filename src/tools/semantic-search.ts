@@ -133,6 +133,24 @@ export function registerSemanticSearch(server: McpServer): void {
         }
       }
 
+      // Validate the cursor before paying for a KNN search — a cursor
+      // minted by a DIFFERENT tool (or corrupted) must not silently
+      // restart semantic_search at page 1.
+      if (params.cursor && pagination.decodeCursor(params.cursor) === undefined) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                { error: `Invalid pagination cursor: ${params.cursor}` },
+                null,
+                2,
+              ),
+            },
+          ],
+        }
+      }
+
       const freshness = await freshnessGuard.ensureFresh()
 
       const projectSlug = await projectResolver.resolveProjectFilter({

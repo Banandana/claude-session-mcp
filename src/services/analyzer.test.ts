@@ -183,6 +183,25 @@ describe('Analyzer', () => {
       const results = analyzer.analyze('tool_failures')
       expect(results).toEqual([])
     })
+
+    it('splits a multi-tool error turn so BOTH tools get credited (regression: GROUP BY raw CSV string)', () => {
+      // Before the fix, a turn with tool_names='Bash,Read' formed its own
+      // "Bash,Read" bucket instead of incrementing the existing Bash and
+      // Read buckets.
+      db.prepare(`
+        INSERT INTO messages (id, session_id, role, type, timestamp, is_error, is_correction, has_tool_use, tool_names)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('msg-tf-multi', 'session-alpha-1', 'assistant', 'assistant', '2026-03-28T10:05:00Z', 1, 0, 1, 'Bash,Read')
+
+      const results = analyzer.analyze('tool_failures')
+      const byLabel = new Map(results.map(r => [r.label, r.count]))
+
+      expect(byLabel.has('Bash,Read')).toBe(false)
+      // Existing fixture: Bash x2 (msg-tf1, msg-tf2), Read x1 (msg-tf3),
+      // plus this new multi-tool turn credits both.
+      expect(byLabel.get('Bash')).toBe(3)
+      expect(byLabel.get('Read')).toBe(2)
+    })
   })
 
   describe('costly_sessions metric', () => {

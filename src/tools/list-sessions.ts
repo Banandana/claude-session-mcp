@@ -50,6 +50,22 @@ export function registerListSessions(server: McpServer): void {
 
       const freshness = await freshnessGuard.ensureFresh()
 
+      // Decode the cursor up front — a cursor minted by a DIFFERENT tool
+      // (or corrupted) must not silently restart list_sessions at page 1.
+      let offset = 0
+      if (params.cursor) {
+        const decoded = pagination.decodeCursor(params.cursor)
+        if (decoded === undefined) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              error: `Invalid pagination cursor: ${params.cursor}`,
+            }, null, 2) }],
+          }
+        }
+        offset = decoded
+      }
+      const limit = params.limit ?? pagination.defaultLimit
+
       const slug = await projectResolver.resolveProjectFilter({
         project: params.project,
         path: params.path,
@@ -112,6 +128,12 @@ export function registerListSessions(server: McpServer): void {
       const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
       const orderBy = SORT_COLUMNS[params.sortBy ?? 'recent']
 
+      // Total count with the SAME WHERE clause, independent of LIMIT/OFFSET.
+      const countRow = db.prepare(
+        `SELECT COUNT(*) as cnt FROM sessions ${whereClause}`
+      ).get(...sqlParams) as { cnt: number }
+      const total = countRow.cnt
+
       const sql = `
         SELECT id, source, project_slug, cwd, branch, started_at, ended_at,
                duration_minutes, total_turns, total_tokens, message_count,
@@ -122,9 +144,10 @@ export function registerListSessions(server: McpServer): void {
         FROM sessions
         ${whereClause}
         ORDER BY ${orderBy}
+        LIMIT ? OFFSET ?
       `
 
-      const rows = db.prepare(sql).all(...sqlParams) as Array<Record<string, unknown>>
+      const rows = db.prepare(sql).all(...sqlParams, limit, offset) as Array<Record<string, unknown>>
 
       const sessions = rows.map(row => {
         const title = (row['custom_title'] as string | null) ?? (row['ai_title'] as string | null)
@@ -172,18 +195,16 @@ export function registerListSessions(server: McpServer): void {
           }))
         : sessions
 
-      const page = pagination.paginate(output, {
-        cursor: params.cursor,
-        limit: params.limit,
-      })
+      const hasMore = offset + output.length < total
+      const nextCursor = hasMore ? pagination.encodeCursor(offset + output.length) : undefined
 
       const meta = formatter.formatMeta(freshness)
-      const paginationResult = page.hasMore
-        ? { cursor: page.cursor!, hasMore: true, totalEstimate: page.totalEstimate }
-        : { cursor: '', hasMore: false, totalEstimate: page.totalEstimate }
+      const paginationResult = hasMore
+        ? { cursor: nextCursor!, hasMore: true, totalEstimate: total }
+        : { cursor: '', hasMore: false, totalEstimate: total }
 
       return {
-        content: [{ type: 'text' as const, text: JSON.stringify(formatter.format(page.items, meta, paginationResult), null, 2) }],
+        content: [{ type: 'text' as const, text: JSON.stringify(formatter.format(output, meta, paginationResult), null, 2) }],
       }
     }
   )
