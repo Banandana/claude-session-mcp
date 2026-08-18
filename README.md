@@ -71,19 +71,22 @@ Every session row carries a `source` column. `list_sessions`, `search`, `analyze
 
 ### Field availability by source
 
-Not every source's transcript format carries every field a tool can ask for. Rather than a silent `null`, the gap is documented here and called out in the `.describe()` of the tools it bites. `claude-code` and `pi-code` rows describe what their adapters actually populate today; `codex` and `opencode` rows marked "planned" describe the mapping in [`docs/multi-source-plan.md`](docs/multi-source-plan.md), not code confirmed to be indexing live data yet.
+Not every source's transcript format carries every field a tool can ask for. Rather than a silent `null`, the gap is documented here and called out in the `.describe()` of the tools it bites. Every row below describes what the adapters populate today, confirmed by indexing this machine's real stores (213 sessions across all four sources).
 
 | Field | claude-code | pi-code | codex | opencode |
 |---|---|---|---|---|
+| **Tool-failure signal** (`error_count`, `isError`) | Yes — `tool_result.is_error` | Yes — `toolResult.isError` | **None — `error_count` is `NULL`, not 0.** Codex tool outputs carry only `type`/`id`/`call_id`/`output`, and every `patch_apply_end` observed reported `success: true`. A failure is visible only as prose inside the output text, and trusting that text is exactly what inflated error counts 175% (see below). A `0` here would read as "Codex never fails"; `NULL` reads as "not observable" | Yes — `state.status === 'error'` |
 | Per-session cost (`cost_usd`) | Real, but only for the single most-recently-active session per project (a `.config.json` snapshot, not a ledger — older sessions read `NULL`) | Never — the adapter always reports no cost; Pi's own `usage.cost.total` per message is parsed but never aggregated to session level | Never — no cost data exists in Codex rollouts | Real, per session — mapped directly from opencode's `session.cost` column |
 | PR links | Yes — `pr-link` JSONL entries → `pr_links` table | No | No (not in the mapping) | No (not in the mapping) |
-| Context-collapse metadata | Yes — `marble-origami-commit` entries → `context_collapses` table | No | Planned — `compacted` / `event_msg:context_compacted` → `ContextCollapse` | Planned — `part type=compaction` → `ContextCollapse` |
-| Per-message cache tokens | Yes | Yes — `cacheRead`/`cacheWrite` → `cache_creation_input_tokens`/`cache_read_input_tokens` | Planned — `event_msg:token_count` (`cached_input_tokens`/`cache_write_input_tokens`) | Planned — `part type=step-finish` `tokens{}` |
-| Thinking-block presence (`hasThinking`) | Yes, with text | Yes, with text | Planned — flag only; `reasoning` content is `encrypted_content`, no text | Planned — `part type=reasoning` |
-| Subagents | Yes — `agent-*.jsonl` via `subagent-parser` | No — pi has no `agent-*.jsonl` files | Planned — `thread_spawn` → `SubagentMeta` | Not in the mapping |
-| Model tracking (`models_used`) | Yes | Yes — `model_change` events | Planned — per-turn model from `turn_context` | Planned — `session.model` |
+| Context-collapse metadata | Yes — `marble-origami-commit` entries → `context_collapses` table | No | Yes — `compacted` / `event_msg:context_compacted` → `ContextCollapse` | Yes — `part type=compaction` → `ContextCollapse` |
+| Per-message cache tokens | Yes | Yes — `cacheRead`/`cacheWrite` → `cache_creation_input_tokens`/`cache_read_input_tokens` | Yes — `event_msg:token_count` (`cached_input_tokens`/`cache_write_input_tokens`) | Yes — `part type=step-finish` `tokens{}` |
+| Thinking-block presence (`hasThinking`) | Yes, with text | Yes, with text | Flag only — `reasoning` payloads are `encrypted_content`, so there is no readable text to return | Yes, with text — `part type=reasoning` |
+| Subagents | Yes — `agent-*.jsonl` via `subagent-parser` | No — pi has no `agent-*.jsonl` files | Yes — child rollouts (`source.subagent.thread_spawn`) attach to their parent; 85 of this machine's 123 rollouts are children | Yes — child sessions (`session.parent_id`) attach to their parent |
+| Model tracking (`models_used`) | Yes | Yes — `model_change` events | Yes — per-turn model from `turn_context` | Yes — `session.model` |
 
-This means, for example: `analyze`'s `costly_sessions` metric ranks `codex` and `pi-code` sessions purely by token count (their `cost_usd` is always `NULL`), and `list_sessions`' `minCost`/`maxCost` filters silently exclude every `codex` and `pi-code` session. `context_audit`'s cost-based metrics carry the same `cost_usd` gap.
+This means, for example: `analyze`'s `costly_sessions` metric ranks `codex` and `pi-code` sessions purely by token count (their `cost_usd` is always `NULL`), and `list_sessions`' `minCost`/`maxCost` filters silently exclude every `codex` and `pi-code` session. `context_audit`'s cost-based metrics carry the same `cost_usd` gap. Likewise, `analyze`'s error metrics and `query_turns`' `isError` filter cannot see Codex failures at all — not because Codex does not fail, but because its transcript format never records that it did.
+
+**On error counts generally.** `isError` is set from a source's explicit failure flag and nothing else. It is deliberately NOT inferred from result text: a tool result reading `0 errors reported`, a `grep` for the word, or a command writing to `stderr` while exiting cleanly are all successes. Measured on one real session, the previous text-matching heuristic flagged 286 turns as errors where only 104 tool results actually carried `is_error` — a 175% inflation that fed every error metric in the product.
 
 ## Setup
 

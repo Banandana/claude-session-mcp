@@ -48,6 +48,7 @@ interface SessionWatermarkRow {
  */
 export class OpencodeAdapter implements SessionAdapter {
   readonly source = 'opencode'
+  readonly errorSignal = 'explicit' as const
 
   private readonly database: OpencodeDatabase
   private readonly discovery: OpencodeSessionDiscovery

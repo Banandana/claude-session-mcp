@@ -37,6 +37,15 @@ export class AdapterRegistry {
     return this.adapters
   }
 
+  /**
+   * Whether the adapter owning `source` can observe tool failures at all.
+   * Unknown sources are assumed 'explicit' so a missing adapter never turns
+   * real counts into NULLs.
+   */
+  errorSignalForSource(source: string): 'explicit' | 'none' {
+    return this.adaptersBySource.get(source)?.errorSignal ?? 'explicit'
+  }
+
   /** Supplies (or replaces) the sessionId -> source hint map. See `ownerHints`. */
   setOwnerHints(hints: ReadonlyMap<string, string>): void {
     this.ownerHints = hints

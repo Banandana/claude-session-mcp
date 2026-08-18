@@ -57,6 +57,11 @@ export { pathToSlug, slugToPath, extractSessionIdFromFilename } from './rollout-
  */
 export class CodexAdapter implements SessionAdapter {
   readonly source = 'codex'
+  // Codex rollouts carry NO failure channel: tool outputs have only
+  // type/id/call_id/output, and patch_apply_end.success was true in every
+  // event observed across live rollouts. Failures show up only as prose in
+  // the output text — the exact signal that must not be trusted (B1).
+  readonly errorSignal = 'none' as const
 
   private readonly discovery: CodexSessionDiscovery
   private readonly conversationParser: CodexConversationParser

@@ -30,6 +30,7 @@ export { ConfigReader } from './config-reader'
 
 export class ClaudeCodeAdapter implements SessionAdapter {
   readonly source = 'claude-code'
+  readonly errorSignal = 'explicit' as const
 
   private readonly discovery: SessionDiscovery
   private readonly conversationParser: ConversationParser

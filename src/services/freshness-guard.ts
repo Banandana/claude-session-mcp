@@ -503,6 +503,16 @@ export class FreshnessGuard {
   }
 
   private computeSessionMetrics(sessionId: string, messages?: readonly NormalizedMessage[]): void {
+    // A source whose format has no failure channel must not report 0 errors —
+    // that reads as "this agent never fails" in cross-source comparisons.
+    // NULL says "not observable here", which is the truth. See
+    // ErrorSignalSupport in types/adapter.ts.
+    const sourceRow = this.db.prepare(
+      'SELECT source FROM sessions WHERE id = ?'
+    ).get(sessionId) as { source: string | null } | undefined
+    const errorsObservable = sourceRow?.source
+      ? this.registry.errorSignalForSource(sourceRow.source) === 'explicit'
+      : true
     // Get started_at (+ the fields needed to resolve project_id) from session row
     const sessionRow = this.db.prepare(
       'SELECT started_at, source, project_slug, cwd, project_id FROM sessions WHERE id = ?'
@@ -623,7 +633,7 @@ export class FreshnessGuard {
       endedAt,
       durationMinutes,
       messageCount,
-      msgStats.error_count,
+      errorsObservable ? msgStats.error_count : null,
       msgStats.correction_count,
       saRow.cnt,
       JSON.stringify(toolCounts),

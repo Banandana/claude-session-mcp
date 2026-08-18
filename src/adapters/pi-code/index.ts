@@ -39,6 +39,7 @@ export { PiSessionNotFoundError, PiSessionReadError, PiAdapterError } from './er
  */
 export class PiCodeAdapter implements SessionAdapter {
   readonly source = 'pi-code'
+  readonly errorSignal = 'explicit' as const
 
   private readonly discovery: PiSessionDiscovery
   private readonly conversationParser: PiConversationParser

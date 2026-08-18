@@ -20,6 +20,7 @@ function createMockRegistry(options: {
   fileChanges?: FileChange[]
   subagents?: SubagentMeta[]
   freshnessResult?: FreshnessResult
+  errorSignal?: 'explicit' | 'none'
 }): AdapterRegistry {
   const {
     sessions = [],
@@ -27,10 +28,12 @@ function createMockRegistry(options: {
     fileChanges = [],
     subagents = [],
     freshnessResult,
+    errorSignal = 'explicit',
   } = options
 
   const adapter = {
     source: 'mock',
+    errorSignal,
     async *discoverProjects(): AsyncIterable<ProjectMeta> {},
     async *discoverSessions(): AsyncIterable<SessionMeta> {
       for (const s of sessions) yield s
@@ -157,6 +160,52 @@ describe('FreshnessGuard — computeSessionMetrics', () => {
     expect(session.duration_minutes).toBe(30) // 30 min between NOW and LATER
     expect(session.topic).toBeDefined()
     expect(typeof session.topic).toBe('string')
+  })
+
+  it('stores error_count as NULL, not 0, for a source that cannot observe failures', async () => {
+    // Codex rollouts carry no failure channel at all, so a 0 here would read
+    // as "this agent never fails" in cross-source comparisons. NULL means
+    // "not observable". The messages below carry no isError flag precisely
+    // because such a source could never set one.
+    const messages: NormalizedMessage[] = [
+      makeMessage({ id: 'msg-1', role: 'user', timestamp: NOW, contentBlocks: [{ type: 'text', text: 'run the build' }], toolNames: undefined }),
+      makeMessage({ id: 'msg-2', role: 'assistant', timestamp: LATER, toolNames: ['exec'] }),
+    ]
+
+    const registry = createMockRegistry({
+      sessions: [makeSessionMeta()],
+      messages,
+      errorSignal: 'none',
+    })
+
+    const guard = new FreshnessGuard(registry, indexManager, tempDir, db)
+    await guard.ensureFresh()
+
+    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(SESSION_ID) as Record<string, unknown>
+    expect(session.error_count).toBeNull()
+    // Everything else must still be computed normally.
+    expect(session.message_count).toBe(2)
+  })
+
+  it('still stores a real error_count for a source that can observe failures', async () => {
+    // The counterpart to the test above: if this ever returned NULL too, the
+    // NULL above would prove nothing.
+    const messages: NormalizedMessage[] = [
+      makeMessage({ id: 'msg-1', role: 'user', timestamp: NOW, contentBlocks: [{ type: 'text', text: 'run the build' }], toolNames: undefined }),
+      makeMessage({ id: 'msg-2', role: 'assistant', timestamp: LATER, isError: true, toolNames: ['Bash'] }),
+    ]
+
+    const registry = createMockRegistry({
+      sessions: [makeSessionMeta()],
+      messages,
+      errorSignal: 'explicit',
+    })
+
+    const guard = new FreshnessGuard(registry, indexManager, tempDir, db)
+    await guard.ensureFresh()
+
+    const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(SESSION_ID) as Record<string, unknown>
+    expect(session.error_count).toBe(1)
   })
 
   it('produces correct tool_counts JSON', async () => {

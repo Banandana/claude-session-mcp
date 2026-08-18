@@ -37,8 +37,29 @@ export interface SessionMetadataResult {
   readonly gitBranch?: string | undefined
 }
 
+/**
+ * Whether a source's transcript format can tell us a tool call FAILED.
+ *
+ * - `'explicit'` — the format carries a real failure flag the adapter reads
+ *   (claude's `tool_result.is_error`, pi's `toolResult.isError`, opencode's
+ *   `state.status === 'error'`).
+ * - `'none'` — the format carries no failure channel at all. Codex tool
+ *   outputs have only `type/id/call_id/output`, and every `patch_apply_end`
+ *   observed reports `success: true`; a failure is visible only as prose
+ *   inside the output text, which is exactly the signal that inflated error
+ *   counts 175% before finding B1.
+ *
+ * A source with `'none'` stores `error_count = NULL`, not 0. Zero would read
+ * as "this agent never fails" in precisely the cross-source comparisons this
+ * server exists to support; NULL reads as "not observable here", which is
+ * the truth.
+ */
+export type ErrorSignalSupport = 'explicit' | 'none'
+
 export interface SessionAdapter {
   readonly source: string
+  /** See {@link ErrorSignalSupport}. Governs whether error_count is a count or NULL. */
+  readonly errorSignal: ErrorSignalSupport
   discoverProjects(): AsyncIterable<ProjectMeta>
   discoverSessions(project?: string): AsyncIterable<SessionMeta>
   getMessages(sessionId: string): AsyncIterable<NormalizedMessage>
