@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3'
 import type { AdapterRegistry } from './adapter-registry'
 import type { IndexManager } from './index-manager'
 import type { LocalLlmClient } from './local-llm-client'
-import type { IndexState, NormalizedMessage, SessionMeta } from '../types'
+import type { FileChange, IndexState, NormalizedMessage, SessionMeta, SubagentMeta } from '../types'
 import type { TurnIndexer } from './turn-indexer'
 import type { EmbeddingIndexer } from './embedding-indexer'
 import { generateTopic } from './topic-generator'
@@ -364,106 +364,131 @@ export class FreshnessGuard {
     const deleteFtsEntry = this.db.prepare(
       'DELETE FROM messages_fts WHERE rowid = ?'
     )
+    // Hoisted, matching syncNewSessions. The previous version called
+    // db.prepare() twice per message inside the loop and looked the rowid
+    // back up with a SELECT, despite the INSERT already returning it.
+    const insertFts = this.db.prepare(
+      'INSERT OR REPLACE INTO messages_fts (rowid, search_text) VALUES (?, ?)'
+    )
+    const insertFileChange = this.db.prepare(`
+      INSERT OR IGNORE INTO file_changes (session_id, message_id, file_path, operation, timestamp)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    const insertSubagent = this.db.prepare(`
+      INSERT OR IGNORE INTO subagents (id, session_id, agent_type, description, total_tokens, total_tools, duration_ms, model)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const deleteFileChanges = this.db.prepare('DELETE FROM file_changes WHERE session_id = ?')
+    const deleteSubagents = this.db.prepare('DELETE FROM subagents WHERE session_id = ?')
+    const selectProjectSlug = this.db.prepare('SELECT project_slug FROM sessions WHERE id = ?')
+    const sumTokens = this.db.prepare('SELECT SUM(token_count) as total FROM messages WHERE session_id = ?')
+    const updateTotals = this.db.prepare('UPDATE sessions SET total_tokens = ?, total_turns = ? WHERE id = ?')
 
     for (const sessionId of sessionIds) {
-      // Delete stale FTS entries before re-inserting messages
-      const existingRowids = selectExistingRowids.all(sessionId) as Array<{ rowid: number }>
-      for (const { rowid } of existingRowids) {
-        deleteFtsEntry.run(rowid)
-      }
-
+      // Collect all async data before the transaction (same shape as
+      // syncNewSessions — better-sqlite3 transactions are synchronous, so
+      // nothing awaited may happen inside one).
       const messages: NormalizedMessage[] = []
       for await (const msg of this.registry.getMessages(sessionId)) {
         messages.push(msg)
       }
 
-      for (const msg of messages) {
-        const contentPreview = this.extractContentPreview(msg)
-        const searchText = this.extractSearchText(msg)
-        const tokenCount = msg.tokenUsage
-          ? msg.tokenUsage.input_tokens + msg.tokenUsage.output_tokens
-          : 0
-        const hasToolUse = msg.toolNames && msg.toolNames.length > 0 ? 1 : 0
-        const toolNames = msg.toolNames ? msg.toolNames.join(',') : null
+      const fileChanges: FileChange[] = []
+      for await (const change of this.registry.getFileChanges(sessionId)) {
+        fileChanges.push(change)
+      }
 
-        insertMessage.run(
-          msg.id,
-          sessionId,
-          msg.role,
-          msg.role,
-          msg.timestamp,
-          msg.model ?? null,
-          tokenCount,
-          hasToolUse,
-          toolNames,
-          msg.isError ? 1 : 0,
-          msg.isCorrection ? 1 : 0,
-          contentPreview,
-          msg.tokenUsage?.cache_creation_input_tokens ?? 0,
-          msg.tokenUsage?.cache_read_input_tokens ?? 0,
-          msg.hasThinking ? 1 : 0,
-          searchText,
-        )
+      const subagents: SubagentMeta[] = []
+      for await (const agent of this.registry.getSubagents(sessionId)) {
+        subagents.push(agent)
+      }
 
-        if (searchText) {
-          const row = this.db.prepare('SELECT rowid FROM messages WHERE id = ?').get(msg.id) as { rowid: number } | undefined
-          if (row) {
-            this.db.prepare('INSERT OR REPLACE INTO messages_fts (rowid, search_text) VALUES (?, ?)').run(row.rowid, searchText)
+      // Run all DB writes in a single transaction. Previously each of the
+      // thousands of inserts committed on its own, which on a long session
+      // dominated the re-sync.
+      this.db.transaction(() => {
+        // Delete stale FTS entries before re-inserting messages
+        const existingRowids = selectExistingRowids.all(sessionId) as Array<{ rowid: number }>
+        for (const { rowid } of existingRowids) {
+          deleteFtsEntry.run(rowid)
+        }
+
+        for (const msg of messages) {
+          const contentPreview = this.extractContentPreview(msg)
+          const searchText = this.extractSearchText(msg)
+          const tokenCount = msg.tokenUsage
+            ? msg.tokenUsage.input_tokens + msg.tokenUsage.output_tokens
+            : 0
+          const hasToolUse = msg.toolNames && msg.toolNames.length > 0 ? 1 : 0
+          const toolNames = msg.toolNames ? msg.toolNames.join(',') : null
+
+          const result = insertMessage.run(
+            msg.id,
+            sessionId,
+            msg.role,
+            msg.role,
+            msg.timestamp,
+            msg.model ?? null,
+            tokenCount,
+            hasToolUse,
+            toolNames,
+            msg.isError ? 1 : 0,
+            msg.isCorrection ? 1 : 0,
+            contentPreview,
+            msg.tokenUsage?.cache_creation_input_tokens ?? 0,
+            msg.tokenUsage?.cache_read_input_tokens ?? 0,
+            msg.hasThinking ? 1 : 0,
+            searchText,
+          )
+
+          if (searchText && result.lastInsertRowid) {
+            insertFts.run(result.lastInsertRowid, searchText)
           }
         }
-      }
 
-      // Aggregate token counts
-      const tokenRow = this.db.prepare(
-        'SELECT SUM(token_count) as total FROM messages WHERE session_id = ?'
-      ).get(sessionId) as { total: number | null } | undefined
-      if (tokenRow?.total) {
-        this.db.prepare('UPDATE sessions SET total_tokens = ?, total_turns = ? WHERE id = ?')
-          .run(tokenRow.total, messages.length, sessionId)
-      }
+        // Aggregate token counts
+        const tokenRow = sumTokens.get(sessionId) as { total: number | null } | undefined
+        if (tokenRow?.total) {
+          updateTotals.run(tokenRow.total, messages.length, sessionId)
+        }
 
-      // Re-index file changes
-      this.db.prepare('DELETE FROM file_changes WHERE session_id = ?').run(sessionId)
-      const insertFileChange = this.db.prepare(`
-        INSERT OR IGNORE INTO file_changes (session_id, message_id, file_path, operation, timestamp)
-        VALUES (?, ?, ?, ?, ?)
-      `)
-      for await (const change of this.registry.getFileChanges(sessionId)) {
-        insertFileChange.run(
-          sessionId,
-          change.messageId ?? null,
-          change.filePath,
-          change.operation,
-          change.timestamp,
-        )
-      }
+        // Re-index file changes
+        deleteFileChanges.run(sessionId)
+        for (const change of fileChanges) {
+          insertFileChange.run(
+            sessionId,
+            change.messageId ?? null,
+            change.filePath,
+            change.operation,
+            change.timestamp,
+          )
+        }
 
-      // Re-index subagents
-      this.db.prepare('DELETE FROM subagents WHERE session_id = ?').run(sessionId)
-      const insertSubagent = this.db.prepare(`
-        INSERT OR IGNORE INTO subagents (id, session_id, agent_type, description, total_tokens, total_tools, duration_ms, model)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      for await (const agent of this.registry.getSubagents(sessionId)) {
-        insertSubagent.run(
-          agent.id,
-          sessionId,
-          agent.agentType ?? null,
-          agent.description ?? null,
-          agent.totalTokens ?? null,
-          agent.totalTools ?? null,
-          agent.durationMs ?? null,
-          agent.model ?? null,
-        )
-      }
+        // Re-index subagents
+        deleteSubagents.run(sessionId)
+        for (const agent of subagents) {
+          insertSubagent.run(
+            agent.id,
+            sessionId,
+            agent.agentType ?? null,
+            agent.description ?? null,
+            agent.totalTokens ?? null,
+            agent.totalTools ?? null,
+            agent.durationMs ?? null,
+            agent.model ?? null,
+          )
+        }
 
-      // Compute and store session metrics + metadata
-      this.computeSessionMetrics(sessionId, messages)
-      const projectSlug = this.db.prepare('SELECT project_slug FROM sessions WHERE id = ?').get(sessionId) as { project_slug: string | null } | undefined
+        this.computeSessionMetrics(sessionId, messages)
+
+        // Index turn events for structured queries
+        this.turnIndexer?.indexSession(sessionId, messages)
+      })()
+
+      // Metadata sync is async (fetches cost data) — must be outside the
+      // transaction, same as syncNewSessions.
+      const projectSlug = selectProjectSlug.get(sessionId) as { project_slug: string | null } | undefined
       await this.syncSessionMetadata(sessionId, projectSlug?.project_slug ?? undefined)
-
-      // Index turn events for structured queries
-      this.turnIndexer?.indexSession(sessionId, messages)
     }
 
     await this.updateWatermarks(sessionIds)
