@@ -1,19 +1,17 @@
 import { createHash } from 'node:crypto'
 import type Database from 'better-sqlite3'
 import type { InvocationRecord } from '../types/invocation-log'
-import { getNormalizer } from './param-normalizers'
 
 /**
- * Records every MCP tool call to `tool_invocations` and upserts a matching
- * row in `audit_watermarks` if the tool has a registered normalizer and the
- * call succeeded.
+ * Records every MCP tool call to `tool_invocations` — cheap call telemetry
+ * (tool name, params, timing, result status/size). No result content is
+ * stored, only byte size.
  *
  * Logging failures never propagate — telemetry must never break a real
  * tool call. Errors are written to stderr and swallowed.
  */
 export class ToolInvocationLogger {
   private readonly insertInvocation: Database.Statement
-  private readonly upsertWatermark: Database.Statement
 
   constructor(private readonly db: Database.Database) {
     this.insertInvocation = this.db.prepare(`
@@ -21,17 +19,6 @@ export class ToolInvocationLogger {
         tool_name, params_json, params_hash, called_at, duration_ms,
         result_status, result_size, caller_session, project_path
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `)
-
-    this.upsertWatermark = this.db.prepare(`
-      INSERT INTO audit_watermarks (
-        tool_name, params_hash, params_canonical_json, project_path,
-        first_called_at, last_called_at, call_count
-      ) VALUES (?, ?, ?, ?, ?, ?, 1)
-      ON CONFLICT(tool_name, params_hash) DO UPDATE SET
-        last_called_at = excluded.last_called_at,
-        call_count = call_count + 1,
-        project_path = COALESCE(audit_watermarks.project_path, excluded.project_path)
     `)
   }
 
@@ -48,12 +35,7 @@ export class ToolInvocationLogger {
     const calledAt = rec.calledAt ?? Date.now()
     const rawObj = isPlainObject(rec.rawParams) ? rec.rawParams : {}
     const paramsJson = safeStringify(rawObj)
-
-    const normalizer = getNormalizer(rec.toolName)
-    const canonical = normalizer ? normalizer(rawObj) : null
-    const canonicalJson = canonical ? canonicalStringify(canonical.shape) : paramsJson
-    const paramsHash = sha1Hex(`${rec.toolName}:${canonicalJson}`)
-    const projectPath = canonical?.projectPath ?? null
+    const paramsHash = sha1Hex(`${rec.toolName}:${canonicalStringify(rawObj)}`)
 
     this.insertInvocation.run(
       rec.toolName,
@@ -64,20 +46,8 @@ export class ToolInvocationLogger {
       rec.status,
       rec.resultSize,
       rec.callerSession ?? null,
-      projectPath,
+      null,
     )
-
-    // Watermark only on successful calls AND only if the tool has a normalizer.
-    if (rec.status === 'ok' && canonical) {
-      this.upsertWatermark.run(
-        rec.toolName,
-        paramsHash,
-        canonicalJson,
-        projectPath,
-        calledAt,
-        calledAt,
-      )
-    }
   }
 }
 

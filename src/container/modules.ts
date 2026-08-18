@@ -21,7 +21,6 @@ import { PhaseClusterer } from '../services/phase-clusterer'
 import { ContextAuditor } from '../services/context-auditor'
 import { EmbeddingIndexer } from '../services/embedding-indexer'
 import { ToolInvocationLogger } from '../services/invocation-logger'
-import { AuditHistoryService } from '../services/audit-history'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -81,7 +80,7 @@ export function registerInfrastructure(): void {
 
   // LLM clients — local only. LocalLlmClient is the legacy summarization
   // helper used by FreshnessGuard; OpenAiLlmClient is the general-purpose
-  // backend bound under TOKENS.LlmClient for tools like deep_analyze.
+  // backend bound under TOKENS.LlmClient.
   const llmClient = new LocalLlmClient(localLlmUrl, localLlmModelFallback)
   container.bind<LocalLlmClient>(TOKENS.LocalLlmClient).toConstantValue(llmClient)
   const openAiLlmClient = createLlmClient(localLlmUrl, localLlmModelFallback)
@@ -118,7 +117,7 @@ export function registerInfrastructure(): void {
   const embeddingModel = process.env['EMBEDDING_MODEL']
   let embeddingIndexer: EmbeddingIndexer | null = null
   if (embeddingModel) {
-    const embeddingDim = Number(process.env['EMBEDDING_DIM'] ?? '768')
+    const embeddingDim = Number(process.env['EMBEDDING_DIM'] ?? '1024')
     const embeddingBaseUrl = process.env['EMBEDDING_URL'] ?? localLlmUrl
     const embeddingClient = new OpenAiLlmClient(localLlmUrl, localLlmModelFallback, {
       embeddingModel,
@@ -144,9 +143,6 @@ export function registerInfrastructure(): void {
   // Tool-invocation log (V5) — schema is created via IndexManager migrations.
   const invocationLogger = new ToolInvocationLogger(db)
   container.bind<ToolInvocationLogger>(TOKENS.ToolInvocationLogger).toConstantValue(invocationLogger)
-
-  const auditHistory = new AuditHistoryService(db)
-  container.bind<AuditHistoryService>(TOKENS.AuditHistoryService).toConstantValue(auditHistory)
 }
 
 export function registerAll(): void {

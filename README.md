@@ -47,20 +47,23 @@ This is the feedback loop that makes autonomous agents viable long-term. Not jus
 
 ## Tools
 
+13 tools, covering lookup, navigation, search, and cross-session analysis:
+
 | Tool | What it does |
 |------|-------------|
 | `list_projects` | All known projects with session counts, memory presence, branch activity |
 | `get_project` | Project deep-dive — CLAUDE.md, settings, memory entries, session list |
 | `list_sessions` | Sessions filtered by project, date, branch, with sorting |
-| `get_session` | Session metadata at three detail levels: summary, metadata (tools/files/subagents), full (with LLM analysis) |
+| `get_session` | Session metadata at three detail levels: summary, metadata (tools/files/subagents), full (context collapses, opt-in token curve) |
 | `get_conversation` | Phase-clustered session overview — groups turns by activity (Explore → Modify → Execute → Error) |
 | `query_turns` | Search turns by tool name, error/correction status, text pattern, time range |
 | `get_turns` | Full content expansion for specific turns — tool inputs, outputs, text, token usage |
 | `search` | Full-text search across all indexed sessions |
+| `semantic_search` | Vector KNN search via sqlite-vec — finds paraphrased matches FTS misses (opt-in, requires `EMBEDDING_MODEL`) |
 | `get_changes` | File operations tracked across sessions — which files were created/edited when |
 | `get_memory` | Cross-project memory access — user preferences, feedback, project notes |
 | `analyze` | Aggregate pattern discovery — errors, corrections, tool failures, costly sessions, hot files |
-| `deep_analyze` | Send entire session to the local LLM for comprehensive quality analysis |
+| `context_audit` | Context usage auditing — cost breakdown, cache analysis, collapse tracking |
 
 ## Setup
 

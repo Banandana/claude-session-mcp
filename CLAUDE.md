@@ -102,14 +102,14 @@ To keep the index warm without waiting for the next MCP tool call, wire
 The CLI is idempotent and fast (~100ms) when nothing changed. It reuses the
 same `FreshnessGuard` pipeline as MCP tool calls.
 
-### Available Tools (16)
+### Available Tools (13)
 
 | Tool | Purpose |
 |------|---------|
 | `list_projects` | All known projects with metadata |
 | `get_project` | Project detail — CLAUDE.md, settings, memory, stats |
 | `list_sessions` | Sessions filtered by project/date/branch/tokens/cost/cache/toolNames — includes title, cost, mode, tags, models used |
-| `get_session` | Session detail — metadata, turns, files, subagents, PR links, cache stats, context collapses, token curve (opt-in via `sections`) |
+| `get_session` | Session detail — metadata, turns, files, subagents, PR links, cache stats, context collapses, token curve (opt-in via `sections`, positions resolved from stored collapse anchors) |
 | `get_conversation` | Session overview — phase-clustered activity timeline with cost and cache data |
 | `query_turns` | Search turns by tool name, error status, text pattern, time range (supports `compact` mode) |
 | `get_turns` | Full content for specific turns — tool inputs, outputs, text, thinking blocks (opt-in), per-turn model and cache tokens |
@@ -118,10 +118,7 @@ same `FreshnessGuard` pipeline as MCP tool calls.
 | `get_changes` | File operations tracked across sessions |
 | `get_memory` | Cross-project memory access |
 | `analyze` | Pattern discovery — errors, corrections, tool failures, cache efficiency, model usage |
-| `deep_analyze` | Send entire session to the local LLM for comprehensive quality analysis |
-| `context_audit` | Context usage auditing — cost, token attribution, cache, collapses, session profiles |
-| `claude_md_effectiveness` | Before/after metric deltas around CLAUDE.md edit events — measures whether agent self-corrections worked |
-| `get_audit_history` | "When did I last audit X?" — returns last successful invocation per (tool, canonical params) so agents can fill the gap with `since: lastCalledAt`. Includes a `followUp` block. Mode `raw` returns the unfiltered call log |
+| `context_audit` | Context usage auditing — cost breakdown, cache analysis, collapse tracking |
 
 ### Semantic Search Configuration
 
@@ -185,7 +182,7 @@ FTS indexes full message content, not truncated previews:
 
 ## LLM Client Architecture
 
-Single backend: `OpenAiLlmClient` — OpenAI-compatible HTTP against `LOCAL_LLM_URL` (default `http://localhost:30000/v1`, currently Qwen3.5-122B-A10B-AWQ on SGLang with 524K context). Used for background summarization (FreshnessGuard) and `deep_analyze`. The Anthropic remote backend was removed.
+Single backend: `OpenAiLlmClient` — OpenAI-compatible HTTP against `LOCAL_LLM_URL` (default `http://localhost:30000/v1`, currently Qwen3.5-122B-A10B-AWQ on SGLang with 524K context). Used for background summarization (FreshnessGuard). The Anthropic remote backend was removed. `deep_analyze` (whole-session LLM analysis) and `get_session`'s `intent` param (intent-triggered LLM relevance check) were removed 2026-08-18 — sending a full transcript to a shared local inference server is worse than the caller doing its own `get_conversation` + `get_turns` drill-down.
 
 ## Efficiency Fixes (2026-04-02)
 
@@ -198,16 +195,21 @@ Single backend: `OpenAiLlmClient` — OpenAI-compatible HTTP against `LOCAL_LLM_
 - **Type safety**: `TurnReference.role` and `ExpandedTurn.role` typed as `MessageRole` instead of `string`
 - **Summarization**: Fire-and-forget promise now has `.catch()` to prevent unhandled rejections
 
-## Context Usage Auditing (2026-04-06)
+## Context Usage Auditing (2026-04-06, trimmed 2026-08-18)
 
-New `context_audit` tool with 6 metrics for first-class context usage analysis:
+`context_audit` tool with 3 metrics for first-class context usage analysis:
 
 - **cost_breakdown**: Total/avg cost, min/max sessions, temporal trends
-- **token_attribution**: Which tools consume the most context (tool result tokens)
-- **context_utilization**: Token accumulation stats, collapse frequency
 - **cache_analysis**: Cache hit ratios, creation vs read trends
 - **collapse_analysis**: Context collapse frequency and details
-- **session_profile**: Complete context profile per session
+
+Removed 2026-08-18: `token_attribution` (structurally broken — it sums
+`messages.token_count` over `role='user'` rows, but user/tool-result lines in
+these transcripts carry no `usage` block at all — verified 0 of 3917 user
+lines have usage vs 6298 of 6298 assistant lines — so it returned zero for
+every session, and isn't repairable without a new indexed column),
+`context_utilization` and `session_profile` (near-duplicates of
+`list_sessions` and `get_session`).
 
 All metrics support `detail=summary|full`, temporal `groupBy`, and filters (project, date range, token range, cost range, cache hit ratio, model).
 
@@ -217,39 +219,22 @@ All metrics support `detail=summary|full`, temporal `groupBy`, and filters (proj
 
 Phase 1 limitation: `token_count` = input+output combined; true context utilization % deferred to Phase 2 when `input_tokens`/`output_tokens` are stored separately.
 
-## Tool-Invocation Log (2026-04-27)
+## Tool-Invocation Log (2026-04-27, trimmed 2026-08-18)
 
-V5 migration adds two tables for "when did I last audit X" follow-up:
-
-- **`tool_invocations`** — raw firehose, one row per MCP call. Stores
-  `tool_name`, `params_json`, `params_hash`, `called_at`, `duration_ms`,
-  `result_status` ('ok'|'error'), `result_size`, `caller_session`,
-  `project_path`. No result content stored, only byte size.
-- **`audit_watermarks`** — materialized view, one row per
-  (tool_name, params_hash). Upserted on every successful call with a
-  registered normalizer. Carries `first_called_at`, `last_called_at`,
-  `call_count`, `params_canonical_json`.
+V5 migration added `tool_invocations` — raw firehose, one row per MCP call.
+Stores `tool_name`, `params_json`, `params_hash`, `called_at`, `duration_ms`,
+`result_status` ('ok'|'error'), `result_size`, `caller_session`,
+`project_path`. No result content stored, only byte size.
 
 Recording is automatic via `instrumentDispatch()` in `server.ts` — wraps
 `server.tool` so every handler is timed and logged. Logging failures are
 swallowed (stderr only) so telemetry can never break a real call.
 
-**Normalization rule**: shape, not time anchor. Two calls with the same
-`metric` + `project` collapse to one watermark even if their `from`/`to`
-date values differ. The temporal *kind* (rolling vs pinned range) IS part
-of the shape — switching from `days: 7` to `since: "2026-04-20"` creates
-a separate audit. Each audit-style tool has a normalizer in
-`services/param-normalizers/`. Tools without a normalizer (lookups like
-`list_projects`, `get_session`) are still logged raw but skip the
-watermark — that's the cleanest opt-out.
-
-**Watermarks fire only on success.** Failed calls land in
-`tool_invocations` with `result_status='error'` but do not bump the
-watermark. The watermark means "last successful audit."
-
-`get_project` now includes a `recentAudits` block (top 10 most recently
-touched audits for the project, with denylist applied) so agents see
-what's been audited without having to call `get_audit_history` first.
+Removed 2026-08-18: the `audit_watermarks` materialized view, its
+`services/param-normalizers/` normalizers, the `get_audit_history` tool, and
+`get_project`'s `recentAudits` block — the "when did I last audit X" feature
+built on top of the raw firehose. `tool_invocations` itself is kept as cheap,
+unopinionated call telemetry; `ToolInvocationLogger` now only inserts into it.
 
 ## Recently Fixed (2026-03-31)
 

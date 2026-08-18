@@ -6,7 +6,6 @@ import type { FreshnessGuard } from '../services/freshness-guard'
 import type { AdapterRegistry } from '../services/adapter-registry'
 import type { ProjectResolver } from '../services/project-resolver'
 import type { ResponseFormatter } from '../services/response-formatter'
-import type { AuditHistoryService } from '../services/audit-history'
 import type { ProjectMeta, MemoryEntry, ProjectSettings } from '../types'
 import { ConfigReader } from '../adapters/claude-code/config-reader'
 
@@ -24,7 +23,6 @@ export function registerGetProject(server: McpServer): void {
       const registry = container.get<AdapterRegistry>(TOKENS.AdapterRegistry)
       const projectResolver = container.get<ProjectResolver>(TOKENS.ProjectResolver)
       const formatter = container.get<ResponseFormatter>(TOKENS.ResponseFormatter)
-      const auditHistory = container.get<AuditHistoryService>(TOKENS.AuditHistoryService)
 
       const freshness = await freshnessGuard.ensureFresh()
 
@@ -55,8 +53,6 @@ export function registerGetProject(server: McpServer): void {
       }
 
       const detail = params.detail ?? 'summary'
-
-      const recentAudits = auditHistory.recentForProject([slug, foundProject.path], 10)
 
       if (detail === 'full') {
         // CLAUDE.md and settings are claude-code-specific concepts; pi projects
@@ -89,7 +85,6 @@ export function registerGetProject(server: McpServer): void {
           settings,
           memoryEntries,
           sessions,
-          recentAudits,
         }
 
         const meta = formatter.formatMeta(freshness)
@@ -100,7 +95,7 @@ export function registerGetProject(server: McpServer): void {
       }
 
       const meta = formatter.formatMeta(freshness)
-      const response = formatter.format({ ...foundProject, recentAudits }, meta)
+      const response = formatter.format(foundProject, meta)
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }],
       }

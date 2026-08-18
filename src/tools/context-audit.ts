@@ -11,11 +11,10 @@ import type { ContextAuditMetric, ContextAuditDetail, TemporalGrouping } from '.
 export function registerContextAudit(server: McpServer): void {
   server.tool(
     'context_audit',
-    'First-class context usage auditing — cost breakdown, token attribution, cache analysis, context utilization, collapse tracking, and session profiling. Use detail=summary for aggregates, detail=full for per-session breakdowns.',
+    'First-class context usage auditing — cost breakdown, cache analysis, and collapse tracking. Use detail=summary for aggregates, detail=full for per-session breakdowns.',
     {
       metric: z.enum([
-        'cost_breakdown', 'token_attribution', 'context_utilization',
-        'cache_analysis', 'collapse_analysis', 'session_profile',
+        'cost_breakdown', 'cache_analysis', 'collapse_analysis',
       ]).describe('What to audit'),
       detail: z.enum(['summary', 'full']).optional().describe('summary = aggregates, full = per-session (default: summary)'),
       groupBy: z.enum(['day', 'week', 'month']).optional().describe('Temporal bucketing for trend analysis'),
@@ -71,20 +70,11 @@ export function registerContextAudit(server: McpServer): void {
         case 'cost_breakdown':
           result = auditor.costBreakdown(detail, { filters, groupBy, limit })
           break
-        case 'token_attribution':
-          result = auditor.tokenAttribution(detail, { filters, limit })
-          break
-        case 'context_utilization':
-          result = auditor.contextUtilization(detail, { filters, groupBy, limit })
-          break
         case 'cache_analysis':
           result = auditor.cacheAnalysis(detail, { filters, groupBy, limit })
           break
         case 'collapse_analysis':
           result = auditor.collapseAnalysis(detail, { filters, groupBy, limit })
-          break
-        case 'session_profile':
-          result = auditor.sessionProfile(detail, { filters, limit })
           break
       }
 

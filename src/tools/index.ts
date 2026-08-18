@@ -10,11 +10,8 @@ import { registerGetMemory } from './get-memory'
 import { registerAnalyze } from './analyze'
 import { registerGetTurns } from './get-turns'
 import { registerQueryTurns } from './query-turns'
-import { registerDeepAnalyze } from './deep-analyze'
 import { registerContextAudit } from './context-audit'
-import { registerClaudeMdEffectiveness } from './claude-md-effectiveness'
 import { registerSemanticSearch } from './semantic-search'
-import { registerGetAuditHistory } from './get-audit-history'
 
 export function registerTools(server: McpServer): void {
   registerListProjects(server)
@@ -28,9 +25,6 @@ export function registerTools(server: McpServer): void {
   registerAnalyze(server)
   registerGetTurns(server)
   registerQueryTurns(server)
-  registerDeepAnalyze(server)
   registerContextAudit(server)
-  registerClaudeMdEffectiveness(server)
   registerSemanticSearch(server)
-  registerGetAuditHistory(server)
 }

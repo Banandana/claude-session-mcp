@@ -19,5 +19,4 @@ export const TOKENS = {
   ContextAuditor: Symbol('ContextAuditor'),
   EmbeddingIndexer: Symbol('EmbeddingIndexer'),
   ToolInvocationLogger: Symbol('ToolInvocationLogger'),
-  AuditHistoryService: Symbol('AuditHistoryService'),
 } as const
