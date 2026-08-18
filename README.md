@@ -43,7 +43,7 @@ This is the feedback loop that makes autonomous agents viable long-term. Not jus
 
 **Read-only by design.** This server observes history. It doesn't modify transcripts, inject data, or alter session state. The source of truth is always Claude Code's raw JSONL files.
 
-**Adapter-based architecture.** The core is source-agnostic. Claude Code is the first (and currently only) adapter, but the system is designed to index session data from any source that produces structured transcripts.
+**Adapter-based architecture.** The core is source-agnostic. Four coding-agent transcript formats are indexed today — `claude-code`, `pi-code`, `codex`, `opencode` — through the same tools, the same freshness pipeline, and automatic import for all of them. Every session row carries a `source` column; every project is identified by its canonical real filesystem path, not by any one adapter's slug encoding, so the same repository worked on by several agents shows up as one project. See [Sources](#sources) below for exactly which fields each adapter populates.
 
 ## Tools
 
@@ -51,19 +51,39 @@ This is the feedback loop that makes autonomous agents viable long-term. Not jus
 
 | Tool | What it does |
 |------|-------------|
-| `list_projects` | All known projects with session counts, memory presence, branch activity |
-| `get_project` | Project deep-dive — CLAUDE.md, settings, memory entries, session list |
-| `list_sessions` | Sessions filtered by project, date, branch, with sorting |
+| `list_projects` | All known projects with session counts, memory presence, branch activity — one entry per canonical path, merged across sources with a per-source breakdown |
+| `get_project` | Project deep-dive — CLAUDE.md, settings, memory entries, session list spanning every source that has touched the project |
+| `list_sessions` | Sessions filtered by project, date, branch, source, with sorting |
 | `get_session` | Session metadata at three detail levels: summary, metadata (tools/files/subagents), full (context collapses, opt-in token curve) |
 | `get_conversation` | Phase-clustered session overview — groups turns by activity (Explore → Modify → Execute → Error) |
-| `query_turns` | Search turns by tool name, error/correction status, text pattern, time range |
+| `query_turns` | Search turns by tool name, error/correction status, text pattern, time range; cross-session queries also filter by source |
 | `get_turns` | Full content expansion for specific turns — tool inputs, outputs, text, token usage |
-| `search` | Full-text search across all indexed sessions |
+| `search` | Full-text search across all indexed sessions, filterable by source |
 | `semantic_search` | Vector KNN search via sqlite-vec — finds paraphrased matches FTS misses (opt-in, requires `EMBEDDING_MODEL`) |
 | `get_changes` | File operations tracked across sessions — which files were created/edited when |
 | `get_memory` | Cross-project memory access — user preferences, feedback, project notes |
-| `analyze` | Aggregate pattern discovery — errors, corrections, tool failures, costly sessions, hot files |
+| `analyze` | Aggregate pattern discovery — errors, corrections, tool failures, costly sessions, hot files — filterable by source |
 | `context_audit` | Context usage auditing — cost breakdown, cache analysis, collapse tracking |
+
+## Sources
+
+Every session row carries a `source` column. `list_sessions`, `search`, `analyze`, and the cross-session (project-scoped) branch of `query_turns` accept an optional `source` filter — a single value or an array, OR-matched, e.g. `"codex"` or `["claude-code", "opencode"]`. `list_projects` and `get_project` go further: they group sessions onto the project's canonical real filesystem path (via the `projects`/`project_aliases` tables) so one repository worked on by three agents shows up as one project with a per-source breakdown, instead of three unrelated entries in three different slug encodings.
+
+### Field availability by source
+
+Not every source's transcript format carries every field a tool can ask for. Rather than a silent `null`, the gap is documented here and called out in the `.describe()` of the tools it bites. `claude-code` and `pi-code` rows describe what their adapters actually populate today; `codex` and `opencode` rows marked "planned" describe the mapping in [`docs/multi-source-plan.md`](docs/multi-source-plan.md), not code confirmed to be indexing live data yet.
+
+| Field | claude-code | pi-code | codex | opencode |
+|---|---|---|---|---|
+| Per-session cost (`cost_usd`) | Real, but only for the single most-recently-active session per project (a `.config.json` snapshot, not a ledger — older sessions read `NULL`) | Never — the adapter always reports no cost; Pi's own `usage.cost.total` per message is parsed but never aggregated to session level | Never — no cost data exists in Codex rollouts | Real, per session — mapped directly from opencode's `session.cost` column |
+| PR links | Yes — `pr-link` JSONL entries → `pr_links` table | No | No (not in the mapping) | No (not in the mapping) |
+| Context-collapse metadata | Yes — `marble-origami-commit` entries → `context_collapses` table | No | Planned — `compacted` / `event_msg:context_compacted` → `ContextCollapse` | Planned — `part type=compaction` → `ContextCollapse` |
+| Per-message cache tokens | Yes | Yes — `cacheRead`/`cacheWrite` → `cache_creation_input_tokens`/`cache_read_input_tokens` | Planned — `event_msg:token_count` (`cached_input_tokens`/`cache_write_input_tokens`) | Planned — `part type=step-finish` `tokens{}` |
+| Thinking-block presence (`hasThinking`) | Yes, with text | Yes, with text | Planned — flag only; `reasoning` content is `encrypted_content`, no text | Planned — `part type=reasoning` |
+| Subagents | Yes — `agent-*.jsonl` via `subagent-parser` | No — pi has no `agent-*.jsonl` files | Planned — `thread_spawn` → `SubagentMeta` | Not in the mapping |
+| Model tracking (`models_used`) | Yes | Yes — `model_change` events | Planned — per-turn model from `turn_context` | Planned — `session.model` |
+
+This means, for example: `analyze`'s `costly_sessions` metric ranks `codex` and `pi-code` sessions purely by token count (their `cost_usd` is always `NULL`), and `list_sessions`' `minCost`/`maxCost` filters silently exclude every `codex` and `pi-code` session. `context_audit`'s cost-based metrics carry the same `cost_usd` gap.
 
 ## Setup
 

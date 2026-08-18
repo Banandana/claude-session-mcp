@@ -4,6 +4,8 @@ import { TOKENS } from './tokens'
 import { DatabaseConnection } from '../infrastructure/database'
 import { ClaudeCodeAdapter } from '../adapters/claude-code'
 import { PiCodeAdapter } from '../adapters/pi-code'
+import { CodexAdapter } from '../adapters/codex'
+import { OpencodeAdapter, defaultOpencodeDbPath } from '../adapters/opencode'
 import { AdapterRegistry } from '../services/adapter-registry'
 import { IndexManager } from '../services/index-manager'
 import { SearchIndex } from '../services/search-index'
@@ -54,13 +56,19 @@ export function registerInfrastructure(): void {
   const dbConn = new DatabaseConnection(claudeDir)
   container.bind<DatabaseConnection>(TOKENS.Database).toConstantValue(dbConn)
 
-  // Adapter & Registry
+  // Adapters & Registry. Every adapter degrades to "no sessions" when its
+  // store is absent, so registering all four is safe on a machine that only
+  // runs one agent. Each store location is overridable for testing and for
+  // non-default installs.
   const piDir = process.env['PI_AGENT_DIR'] ?? join(homedir(), '.pi', 'agent')
-  const claudeAdapter = new ClaudeCodeAdapter(claudeDir)
-  const piAdapter = new PiCodeAdapter(piDir)
+  const codexDir = process.env['CODEX_DIR'] ?? join(homedir(), '.codex')
+  const opencodeDb = process.env['OPENCODE_DB'] ?? defaultOpencodeDbPath()
+
   const registry = new AdapterRegistry()
-  registry.registerAdapter(claudeAdapter)
-  registry.registerAdapter(piAdapter)
+  registry.registerAdapter(new ClaudeCodeAdapter(claudeDir))
+  registry.registerAdapter(new PiCodeAdapter(piDir))
+  registry.registerAdapter(new CodexAdapter(codexDir))
+  registry.registerAdapter(new OpencodeAdapter(opencodeDb))
   container.bind<AdapterRegistry>(TOKENS.AdapterRegistry).toConstantValue(registry)
 
   // Index & Search — ensure schema/migrations run before services that depend on it.

@@ -117,6 +117,12 @@ export interface FileChange {
   readonly sessionId: string
   readonly messageId?: string | undefined
   readonly filePath: string
-  readonly operation: 'read' | 'write' | 'edit' | 'create'
+  /**
+   * `delete` is emitted by sources that record removals explicitly (Codex's
+   * `patch_apply_end.changes[path].type === 'delete'`). Sources that cannot
+   * distinguish a removal never emit it — absence means "not observed", not
+   * "did not happen".
+   */
+  readonly operation: 'read' | 'write' | 'edit' | 'create' | 'delete'
   readonly timestamp: string
 }

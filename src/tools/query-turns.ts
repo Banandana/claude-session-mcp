@@ -16,6 +16,9 @@ import type Database from 'better-sqlite3'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
+/** Source adapters this server currently knows about (see docs/multi-source-plan.md). */
+const VALID_SOURCES = ['claude-code', 'pi-code', 'codex', 'opencode'] as const
+
 interface TurnFilters {
   readonly toolNames?: readonly string[] | undefined
   readonly isError?: boolean | undefined
@@ -25,6 +28,8 @@ interface TurnFilters {
   readonly textRegex?: RegExp | undefined
   readonly timeRange?: { readonly after?: string | undefined; readonly before?: string | undefined } | undefined
   readonly turnRange?: { readonly from?: number | undefined; readonly to?: number | undefined } | undefined
+  /** Cross-session (project-scoped) queries only — ignored when scoped to a single sessionId. */
+  readonly source?: string | readonly string[] | undefined
 }
 
 interface FilterResult {
@@ -282,7 +287,7 @@ async function ensureTurnEventsIndexed(
   }
 }
 
-function queryCrossSession(
+export function queryCrossSession(
   projectId: string,
   db: Database.Database,
   filters: TurnFilters,
@@ -315,6 +320,14 @@ function queryCrossSession(
     )
     conditions.push(`(${toolConditions.join(' OR ')})`)
     params.push(...filters.toolNames)
+  }
+
+  if (filters.source) {
+    const sources = Array.isArray(filters.source) ? filters.source : [filters.source]
+    if (sources.length > 0) {
+      conditions.push(`s.source IN (${sources.map(() => '?').join(', ')})`)
+      params.push(...sources)
+    }
   }
 
   if (filters.timeRange) {
@@ -379,6 +392,9 @@ export function registerQueryTurns(server: McpServer): void {
       isError: z.boolean().optional().describe('Only error turns'),
       isCorrection: z.boolean().optional().describe('Only correction turns'),
       roles: z.array(z.enum(['user', 'assistant'])).optional().describe('Filter by role'),
+      source: z.union([z.string(), z.array(z.string())]).optional().describe(
+        `Filter by the coding agent that produced the session. Accepts a single value or an array (OR-matched). Cross-session (projectId-scoped) queries only — has no effect when scoped to a single sessionId. Valid values: ${VALID_SOURCES.map(s => `"${s}"`).join(', ')}.`
+      ),
       textPattern: z.string().optional().describe('Regex match against turn text (single-session only, requires sessionId)'),
       timeRange: z.object({
         after: z.string().optional().describe('ISO timestamp lower bound'),
@@ -479,6 +495,7 @@ export function registerQueryTurns(server: McpServer): void {
         textRegex,
         timeRange: params.timeRange,
         turnRange: params.turnRange,
+        source: params.source,
       }
 
       let results: readonly TurnReference[]

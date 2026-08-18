@@ -15,7 +15,7 @@ export function registerGetChanges(server: McpServer): void {
     {
       sessionId: z.string().optional().describe('Filter by session ID'),
       filePath: z.string().optional().describe('Filter by file path (exact match)'),
-      operation: z.string().optional().describe('Filter by operation: read, write, edit, create'),
+      operation: z.string().optional().describe('Filter by operation: read, write, edit, create, delete. Only sources that record removals explicitly emit `delete` (Codex today) — its absence means "not observed", not "no deletions happened".'),
       project: z.string().optional().describe('Filter by project slug'),
       path: z.string().optional().describe('Resolve project from filesystem path'),
       cursor: z.string().optional().describe('Pagination cursor'),

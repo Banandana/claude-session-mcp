@@ -16,8 +16,19 @@ export interface AnalysisResult {
 
 type AnalyzeOptions = {
   projectSlug?: string | undefined
+  /** Restrict to one or more source adapters (e.g. "codex", ["claude-code", "opencode"]). */
+  source?: string | readonly string[] | undefined
   dateRange?: DateRange | undefined
   limit?: number | undefined
+}
+
+/** Appends `<columnRef> IN (...)` to `sql`/`params` when a source filter is set. Returns the (possibly unchanged) sql. */
+function appendSourceCondition(sql: string, columnRef: string, source: AnalyzeOptions['source'], params: (string | number)[]): string {
+  if (!source) return sql
+  const sources = Array.isArray(source) ? source : [source]
+  if (sources.length === 0) return sql
+  params.push(...sources)
+  return `${sql} AND ${columnRef} IN (${sources.map(() => '?').join(', ')})`
 }
 
 export class Analyzer {
@@ -53,6 +64,8 @@ export class Analyzer {
       sql += ` AND s.project_slug = ?`
       params.push(options.projectSlug)
     }
+
+    sql = appendSourceCondition(sql, 's.source', options?.source, params)
 
     if (options?.dateRange?.from) {
       sql += ` AND m.timestamp >= ?`
@@ -98,6 +111,8 @@ export class Analyzer {
       sql += ` AND s.project_slug = ?`
       params.push(options.projectSlug)
     }
+
+    sql = appendSourceCondition(sql, 's.source', options?.source, params)
 
     if (options?.dateRange?.from) {
       sql += ` AND m.timestamp >= ?`
@@ -151,6 +166,8 @@ export class Analyzer {
       params.push(options.projectSlug)
     }
 
+    sql = appendSourceCondition(sql, 's.source', options?.source, params)
+
     if (options?.dateRange?.from) {
       sql += ` AND m.timestamp >= ?`
       params.push(options.dateRange.from)
@@ -192,6 +209,8 @@ export class Analyzer {
       params.push(options.projectSlug)
     }
 
+    sql = appendSourceCondition(sql, 'source', options?.source, params)
+
     if (options?.dateRange?.from) {
       sql += ` AND started_at >= ?`
       params.push(options.dateRange.from)
@@ -202,6 +221,9 @@ export class Analyzer {
       params.push(options.dateRange.to)
     }
 
+    // Cost coverage gap: only opencode and the single most-recently-active
+    // claude-code session per project carry a real cost_usd. pi-code and
+    // codex sessions are always NULL here and rank purely by total_tokens.
     sql += ` ORDER BY COALESCE(cost_usd, 0) DESC, total_tokens DESC LIMIT ?`
     params.push(limit)
 
@@ -238,6 +260,8 @@ export class Analyzer {
       sql += ` AND project_slug = ?`
       params.push(options.projectSlug)
     }
+
+    sql = appendSourceCondition(sql, 'source', options?.source, params)
 
     if (options?.dateRange?.from) {
       sql += ` AND started_at >= ?`
@@ -281,18 +305,27 @@ export class Analyzer {
     const limit = options?.limit ?? 20
     const params: (string | number)[] = []
 
+    // `model` is qualified as `m.model` throughout: both `messages` and
+    // `sessions` have a `model` column, and this metric always joins
+    // sessions (for the project_slug/source filters), so an unqualified
+    // `model` is ambiguous and SQLite rejects the query outright (pre-existing
+    // bug, uncovered — this metric had zero test coverage before the
+    // `source` filter tests added here). Per-message model is also the
+    // semantically correct choice: `token_count` in the SUM is per-message.
     let sql = `
-      SELECT model, COUNT(*) as msg_count, SUM(token_count) as total_tokens
+      SELECT m.model as model, COUNT(*) as msg_count, SUM(m.token_count) as total_tokens
       FROM messages m
       JOIN sessions s ON m.session_id = s.id
     `
 
-    sql += ` WHERE model IS NOT NULL`
+    sql += ` WHERE m.model IS NOT NULL`
 
     if (options?.projectSlug) {
       sql += ` AND s.project_slug = ?`
       params.push(options.projectSlug)
     }
+
+    sql = appendSourceCondition(sql, 's.source', options?.source, params)
 
     if (options?.dateRange?.from) {
       sql += ` AND m.timestamp >= ?`
@@ -304,7 +337,7 @@ export class Analyzer {
       params.push(options.dateRange.to)
     }
 
-    sql += ` GROUP BY model ORDER BY total_tokens DESC LIMIT ?`
+    sql += ` GROUP BY m.model ORDER BY total_tokens DESC LIMIT ?`
     params.push(limit)
 
     const rows = this.db.prepare(sql).all(...params) as Array<{
@@ -329,7 +362,10 @@ export class Analyzer {
       FROM file_changes fc
     `
 
-    if (options?.projectSlug) {
+    // The sessions join is only needed to filter by project or source —
+    // skip it (and the scan it costs) when neither filter is set.
+    const needsSessionJoin = Boolean(options?.projectSlug) || Boolean(options?.source)
+    if (needsSessionJoin) {
       sql += ` JOIN sessions s ON fc.session_id = s.id`
     }
 
@@ -339,6 +375,8 @@ export class Analyzer {
       sql += ` AND s.project_slug = ?`
       params.push(options.projectSlug)
     }
+
+    sql = appendSourceCondition(sql, 's.source', options?.source, params)
 
     if (options?.dateRange?.from) {
       sql += ` AND fc.timestamp >= ?`
