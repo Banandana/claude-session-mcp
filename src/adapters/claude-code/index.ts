@@ -30,6 +30,7 @@ export { ConfigReader } from './config-reader'
 
 export class ClaudeCodeAdapter implements SessionAdapter {
   readonly source = 'claude-code'
+  readonly errorSignal = 'explicit' as const
 
   private readonly discovery: SessionDiscovery
   private readonly conversationParser: ConversationParser
@@ -50,8 +51,12 @@ export class ClaudeCodeAdapter implements SessionAdapter {
   }
 
   async *discoverProjects(): AsyncIterable<ProjectMeta> {
+    // buildProjectCache() already walks the full projects dir (and sniffs
+    // each project's JSONLs for the real cwd) to populate the cache —
+    // yield from that cache instead of re-walking disk a second time
+    // (finding B11, second half).
     await this.discovery.buildProjectCache()
-    yield* this.discovery.discoverProjects()
+    yield* this.discovery.cachedProjects()
   }
 
   async *discoverSessions(project?: string): AsyncIterable<SessionMeta> {
@@ -104,7 +109,7 @@ export class ClaudeCodeAdapter implements SessionAdapter {
     if (!(await fileExists(projectsDir))) {
       // No projects dir — every id the registry passed us was already filtered
       // to ids we previously claimed, so all are gone.
-      const allKnown = Array.from(known.sessionOffsets.keys())
+      const allKnown = Array.from(known.sessionWatermarks.keys())
       return {
         isStale: allKnown.length > 0,
         newSessions: [],
@@ -121,19 +126,19 @@ export class ClaudeCodeAdapter implements SessionAdapter {
       const sessionPath = join(projectsDir, session.projectSlug, `${sessionId}.jsonl`)
       if (!(await fileExists(sessionPath))) continue
 
-      const currentSize = await fileSize(sessionPath)
-      const knownOffset = known.sessionOffsets.get(sessionId)
+      const currentWatermark = await fileSize(sessionPath)
+      const knownWatermark = known.sessionWatermarks.get(sessionId)
 
-      if (knownOffset === undefined) {
+      if (knownWatermark === undefined) {
         newSessions.push(sessionId)
-      } else if (currentSize > knownOffset) {
+      } else if (currentWatermark > knownWatermark) {
         changedSessions.push(sessionId)
       }
     }
 
-    // The registry pre-filters `known.sessionOffsets` to ids this adapter claims,
-    // so any known id we don't see on disk really is gone.
-    for (const knownId of known.sessionOffsets.keys()) {
+    // The registry pre-filters `known.sessionWatermarks` to ids this adapter
+    // claims, so any known id we don't see on disk really is gone.
+    for (const knownId of known.sessionWatermarks.keys()) {
       if (!seenIds.has(knownId)) {
         removedSessions.push(knownId)
       }
@@ -151,7 +156,7 @@ export class ClaudeCodeAdapter implements SessionAdapter {
     return (await this.findSessionPath(sessionId)) !== undefined
   }
 
-  async getSessionSize(sessionId: string): Promise<number | undefined> {
+  async getSessionWatermark(sessionId: string): Promise<number | undefined> {
     const path = await this.findSessionPath(sessionId)
     if (!path) return undefined
     return fileSize(path)

@@ -11,6 +11,14 @@ export interface ContentBlock {
   readonly content?: unknown | undefined
   readonly thinking?: string | undefined
   readonly signature?: string | undefined
+  /**
+   * Explicit error flag for `tool_result` blocks (finding B17), populated
+   * from the source's own signal (claude: `is_error`, pi: `isError`).
+   * Lets a caller expanding a turn with multiple tool results tell WHICH
+   * one failed. `undefined` for non-tool_result blocks, or when the source
+   * gave no explicit signal.
+   */
+  readonly isError?: boolean | undefined
 }
 
 export interface TokenUsage {
@@ -109,6 +117,12 @@ export interface FileChange {
   readonly sessionId: string
   readonly messageId?: string | undefined
   readonly filePath: string
-  readonly operation: 'read' | 'write' | 'edit' | 'create'
+  /**
+   * `delete` is emitted by sources that record removals explicitly (Codex's
+   * `patch_apply_end.changes[path].type === 'delete'`). Sources that cannot
+   * distinguish a removal never emit it — absence means "not observed", not
+   * "did not happen".
+   */
+  readonly operation: 'read' | 'write' | 'edit' | 'create' | 'delete'
   readonly timestamp: string
 }

@@ -10,7 +10,6 @@ export const TOKENS = {
   PaginationManager: Symbol('PaginationManager'),
 
   LocalLlmClient: Symbol('LocalLlmClient'),
-  LlmClient: Symbol('LlmClient'),
   ProjectResolver: Symbol('ProjectResolver'),
   Analyzer: Symbol('Analyzer'),
   ResponseFormatter: Symbol('ResponseFormatter'),
@@ -19,5 +18,4 @@ export const TOKENS = {
   ContextAuditor: Symbol('ContextAuditor'),
   EmbeddingIndexer: Symbol('EmbeddingIndexer'),
   ToolInvocationLogger: Symbol('ToolInvocationLogger'),
-  AuditHistoryService: Symbol('AuditHistoryService'),
 } as const

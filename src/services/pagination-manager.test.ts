@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { PaginationManager } from './pagination-manager'
+import { PaginationManager, InvalidCursorError } from './pagination-manager'
 
 describe('PaginationManager', () => {
   const manager = new PaginationManager()
@@ -80,5 +80,34 @@ describe('PaginationManager', () => {
 
     expect(third.items[0]).toBe('item-40')
     expect(third.items).toHaveLength(20)
+  })
+
+  describe('malformed cursor handling (regression: decodeCursor swallowed parse errors and returned 0)', () => {
+    it('decodeCursor returns undefined for non-base64url garbage', () => {
+      expect(manager.decodeCursor('not a real cursor!!!')).toBeUndefined()
+    })
+
+    it('decodeCursor returns undefined for valid base64url that is not JSON', () => {
+      const notJson = Buffer.from('plain text, not json').toString('base64url')
+      expect(manager.decodeCursor(notJson)).toBeUndefined()
+    })
+
+    it('decodeCursor returns undefined for valid JSON missing the "o" key', () => {
+      const noOffset = Buffer.from(JSON.stringify({ foo: 'bar' })).toString('base64url')
+      expect(manager.decodeCursor(noOffset)).toBeUndefined()
+    })
+
+    it('decodeCursor returns undefined for a negative offset', () => {
+      const negative = Buffer.from(JSON.stringify({ o: -5 })).toString('base64url')
+      expect(manager.decodeCursor(negative)).toBeUndefined()
+    })
+
+    it('decodeCursor still decodes a well-formed cursor', () => {
+      expect(manager.decodeCursor(manager.encodeCursor(7))).toBe(7)
+    })
+
+    it('paginate throws InvalidCursorError for a malformed cursor instead of silently restarting at page 1', () => {
+      expect(() => manager.paginate(items, { cursor: 'garbage-cursor' })).toThrow(InvalidCursorError)
+    })
   })
 })

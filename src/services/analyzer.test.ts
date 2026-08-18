@@ -183,6 +183,25 @@ describe('Analyzer', () => {
       const results = analyzer.analyze('tool_failures')
       expect(results).toEqual([])
     })
+
+    it('splits a multi-tool error turn so BOTH tools get credited (regression: GROUP BY raw CSV string)', () => {
+      // Before the fix, a turn with tool_names='Bash,Read' formed its own
+      // "Bash,Read" bucket instead of incrementing the existing Bash and
+      // Read buckets.
+      db.prepare(`
+        INSERT INTO messages (id, session_id, role, type, timestamp, is_error, is_correction, has_tool_use, tool_names)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('msg-tf-multi', 'session-alpha-1', 'assistant', 'assistant', '2026-03-28T10:05:00Z', 1, 0, 1, 'Bash,Read')
+
+      const results = analyzer.analyze('tool_failures')
+      const byLabel = new Map(results.map(r => [r.label, r.count]))
+
+      expect(byLabel.has('Bash,Read')).toBe(false)
+      // Existing fixture: Bash x2 (msg-tf1, msg-tf2), Read x1 (msg-tf3),
+      // plus this new multi-tool turn credits both.
+      expect(byLabel.get('Bash')).toBe(3)
+      expect(byLabel.get('Read')).toBe(2)
+    })
   })
 
   describe('costly_sessions metric', () => {
@@ -280,6 +299,82 @@ describe('Analyzer', () => {
       for (const r of results) {
         expect(r.projectSlug).toBe('project-beta')
       }
+    })
+  })
+
+  describe('source filter', () => {
+    beforeEach(() => {
+      // A codex session in project-alpha — proves `source` actually
+      // restricts each metric's query rather than accepting and ignoring
+      // the param (a test that passes either way is worthless).
+      db.prepare(`
+        INSERT INTO sessions (id, source, project_slug, started_at, total_tokens, cost_usd)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run('session-codex-1', 'codex', 'project-alpha', '2026-03-28T14:00:00Z', 9000, null)
+
+      db.prepare(`
+        INSERT INTO messages (id, session_id, role, type, timestamp, is_error, is_correction, has_tool_use, tool_names)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run('msg-codex-e1', 'session-codex-1', 'assistant', 'assistant', '2026-03-28T14:01:00Z', 1, 0, 1, 'Bash')
+
+      db.prepare(`
+        INSERT INTO file_changes (session_id, message_id, file_path, operation, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('session-codex-1', 'msg-codex-e1', 'src/index.ts', 'edit', '2026-03-28T14:02:00Z')
+    })
+
+    it('errors: a single source string excludes sessions from other sources', () => {
+      const all = analyzer.analyze('errors', { projectSlug: 'project-alpha' })
+      const claudeOnly = analyzer.analyze('errors', { projectSlug: 'project-alpha', source: 'claude-code' })
+      const codexOnly = analyzer.analyze('errors', { projectSlug: 'project-alpha', source: 'codex' })
+
+      expect(all.some(r => r.sessionId === 'session-codex-1')).toBe(true)
+      expect(claudeOnly.some(r => r.sessionId === 'session-codex-1')).toBe(false)
+      expect(codexOnly.map(r => r.sessionId)).toEqual(['session-codex-1'])
+    })
+
+    it('errors: an array of sources is OR-matched', () => {
+      const results = analyzer.analyze('errors', { projectSlug: 'project-alpha', source: ['codex'] })
+      expect(results.map(r => r.sessionId)).toEqual(['session-codex-1'])
+    })
+
+    it('costly_sessions: filters by source', () => {
+      const results = analyzer.analyze('costly_sessions', { source: 'codex' })
+      expect(results).toHaveLength(1)
+      expect(results[0]!.sessionId).toBe('session-codex-1')
+    })
+
+    it('tool_failures: filters by source', () => {
+      const codexOnly = analyzer.analyze('tool_failures', { source: 'codex' })
+      expect(codexOnly.find(r => r.label === 'Bash')?.count).toBe(1)
+
+      // Pre-existing fixture: Bash x2 from claude-code sessions, unaffected
+      // by the codex row.
+      const claudeOnly = analyzer.analyze('tool_failures', { source: 'claude-code' })
+      expect(claudeOnly.find(r => r.label === 'Bash')?.count).toBe(2)
+    })
+
+    it('frequent_files: filters by source even though the sessions JOIN is conditional', () => {
+      // Regression guard: analyzeFrequentFiles only joined `sessions` when
+      // projectSlug was set. A source-only filter with no join would
+      // silently return every source's file changes.
+      const all = analyzer.analyze('frequent_files')
+      const codexOnly = analyzer.analyze('frequent_files', { source: 'codex' })
+
+      expect(all.find(r => r.label === 'src/index.ts')?.count).toBe(4) // 3 pre-existing + 1 codex
+      expect(codexOnly).toHaveLength(1)
+      expect(codexOnly[0]!.label).toBe('src/index.ts')
+      expect(codexOnly[0]!.count).toBe(1)
+    })
+
+    it('model_usage: filters by source', () => {
+      db.prepare(`
+        INSERT INTO messages (id, session_id, role, type, timestamp, model, token_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run('msg-codex-model', 'session-codex-1', 'assistant', 'assistant', '2026-03-28T14:03:00Z', 'gpt-5-codex', 500)
+
+      const codexOnly = analyzer.analyze('model_usage', { source: 'codex' })
+      expect(codexOnly.map(r => r.label)).toEqual(['gpt-5-codex'])
     })
   })
 })

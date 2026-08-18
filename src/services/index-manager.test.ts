@@ -185,7 +185,7 @@ describe('IndexManager', () => {
     it('sets user_version to latest', () => {
       manager.ensureSchema()
       const version = db.pragma('user_version', { simple: true }) as number
-      expect(version).toBe(6)
+      expect(version).toBe(7)
     })
 
     it('creates new sort indexes', () => {
@@ -217,13 +217,13 @@ describe('IndexManager', () => {
         `INSERT INTO sessions (id, source, byte_offset) VALUES (?, ?, ?)`
       ).run('session-001', 'claude-code', 0)
 
-      expect(manager.getSessionOffset('session-001')).toBe(0)
-      manager.updateSessionOffset('session-001', 4096)
-      expect(manager.getSessionOffset('session-001')).toBe(4096)
+      expect(manager.getSessionWatermark('session-001')).toBe(0)
+      manager.updateSessionWatermark('session-001', 4096)
+      expect(manager.getSessionWatermark('session-001')).toBe(4096)
     })
 
     it('returns 0 for unknown session offset', () => {
-      expect(manager.getSessionOffset('nonexistent-session')).toBe(0)
+      expect(manager.getSessionWatermark('nonexistent-session')).toBe(0)
     })
 
     it('returns all known session IDs', () => {
@@ -269,7 +269,7 @@ describe('IndexManager', () => {
       manager.ensureSchema()
 
       const version = db.pragma('user_version', { simple: true }) as number
-      expect(version).toBe(6)
+      expect(version).toBe(7)
     })
 
     it('creates turn_events indexes', () => {
@@ -357,7 +357,7 @@ describe('IndexManager', () => {
       manager.ensureSchema()
 
       const vAfter = db.pragma('user_version', { simple: true }) as number
-      expect(vAfter).toBe(6)
+      expect(vAfter).toBe(7)
     })
 
     it('creates new sort indexes', () => {
@@ -372,6 +372,66 @@ describe('IndexManager', () => {
     it('migration is idempotent — running ensureSchema twice on v0 does not error', () => {
       manager.ensureSchema()
       expect(() => manager.ensureSchema()).not.toThrow()
+    })
+  })
+
+  // ─── V6 → V7 migration (canonical project identity) ───────────────────────
+
+  describe('v6 → v7 migration (projects / project_aliases)', () => {
+    it('creates the projects table', () => {
+      manager.ensureSchema()
+
+      expect(tableExists(db, 'projects')).toBe(true)
+      const columns = getTableColumns(db, 'projects')
+      expect(columns).toContain('id')
+      expect(columns).toContain('path')
+      expect(columns).toContain('first_seen_at')
+    })
+
+    it('creates the project_aliases table', () => {
+      manager.ensureSchema()
+
+      expect(tableExists(db, 'project_aliases')).toBe(true)
+      const columns = getTableColumns(db, 'project_aliases')
+      expect(columns).toContain('source')
+      expect(columns).toContain('source_slug')
+      expect(columns).toContain('project_id')
+    })
+
+    it('adds project_id column to sessions, keeping project_slug', () => {
+      manager.ensureSchema()
+
+      const columns = getTableColumns(db, 'sessions')
+      expect(columns).toContain('project_id')
+      expect(columns).toContain('project_slug')
+    })
+
+    it('lets project_aliases map multiple source slugs onto one canonical project', () => {
+      manager.ensureSchema()
+
+      db.prepare('INSERT INTO projects (id, path, first_seen_at) VALUES (?, ?, ?)')
+        .run('/home/kitty/foo', '/home/kitty/foo', new Date().toISOString())
+      db.prepare('INSERT INTO project_aliases (source, source_slug, project_id) VALUES (?, ?, ?)')
+        .run('claude-code', '-home-kitty-foo', '/home/kitty/foo')
+      db.prepare('INSERT INTO project_aliases (source, source_slug, project_id) VALUES (?, ?, ?)')
+        .run('pi-code', '--home-kitty-foo--', '/home/kitty/foo')
+
+      const rows = db.prepare('SELECT source, source_slug FROM project_aliases WHERE project_id = ?')
+        .all('/home/kitty/foo') as Array<{ source: string; source_slug: string }>
+      expect(rows).toHaveLength(2)
+      expect(rows.map(r => r.source).sort()).toEqual(['claude-code', 'pi-code'])
+    })
+
+    it('sets user_version to latest', () => {
+      manager.ensureSchema()
+      const version = db.pragma('user_version', { simple: true }) as number
+      expect(version).toBe(7)
+    })
+
+    it('migration is idempotent', () => {
+      manager.ensureSchema()
+      expect(() => manager.ensureSchema()).not.toThrow()
+      expect(tableExists(db, 'projects')).toBe(true)
     })
   })
 })

@@ -15,7 +15,7 @@ export function registerGetChanges(server: McpServer): void {
     {
       sessionId: z.string().optional().describe('Filter by session ID'),
       filePath: z.string().optional().describe('Filter by file path (exact match)'),
-      operation: z.string().optional().describe('Filter by operation: read, write, edit, create'),
+      operation: z.string().optional().describe('Filter by operation: read, write, edit, create, delete. Only sources that record removals explicitly emit `delete` (Codex today) — its absence means "not observed", not "no deletions happened".'),
       project: z.string().optional().describe('Filter by project slug'),
       path: z.string().optional().describe('Resolve project from filesystem path'),
       cursor: z.string().optional().describe('Pagination cursor'),
@@ -30,6 +30,22 @@ export function registerGetChanges(server: McpServer): void {
       const db = dbConn.get()
 
       const freshness = await freshnessGuard.ensureFresh()
+
+      // Decode the cursor up front — a cursor minted by a DIFFERENT tool
+      // (or corrupted) must not silently restart get_changes at page 1.
+      let offset = 0
+      if (params.cursor) {
+        const decoded = pagination.decodeCursor(params.cursor)
+        if (decoded === undefined) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              error: `Invalid pagination cursor: ${params.cursor}`,
+            }, null, 2) }],
+          }
+        }
+        offset = decoded
+      }
+      const limit = params.limit ?? pagination.defaultLimit
 
       const projectSlug = await projectResolver.resolveProjectFilter({
         project: params.project,
@@ -68,15 +84,22 @@ export function registerGetChanges(server: McpServer): void {
         ? 'JOIN sessions s ON fc.session_id = s.id'
         : ''
 
+      // Total count with the SAME WHERE/JOIN clause, independent of LIMIT/OFFSET.
+      const countRow = db.prepare(
+        `SELECT COUNT(*) as cnt FROM file_changes fc ${joinClause} ${whereClause}`
+      ).get(...sqlParams) as { cnt: number }
+      const total = countRow.cnt
+
       const sql = `
         SELECT fc.session_id, fc.file_path, fc.operation, fc.timestamp
         FROM file_changes fc
         ${joinClause}
         ${whereClause}
         ORDER BY fc.timestamp DESC
+        LIMIT ? OFFSET ?
       `
 
-      const rows = db.prepare(sql).all(...sqlParams) as Array<{
+      const rows = db.prepare(sql).all(...sqlParams, limit, offset) as Array<{
         session_id: string
         file_path: string
         operation: string
@@ -90,17 +113,15 @@ export function registerGetChanges(server: McpServer): void {
         timestamp: row.timestamp,
       }))
 
-      const page = pagination.paginate(changes, {
-        cursor: params.cursor,
-        limit: params.limit,
-      })
+      const hasMore = offset + changes.length < total
+      const nextCursor = hasMore ? pagination.encodeCursor(offset + changes.length) : undefined
 
       const meta = formatter.formatMeta(freshness)
-      const paginationResult = page.hasMore
-        ? { cursor: page.cursor!, hasMore: true, totalEstimate: page.totalEstimate }
-        : { cursor: '', hasMore: false, totalEstimate: page.totalEstimate }
+      const paginationResult = hasMore
+        ? { cursor: nextCursor!, hasMore: true, totalEstimate: total }
+        : { cursor: '', hasMore: false, totalEstimate: total }
 
-      const response = formatter.format(page.items, meta, paginationResult)
+      const response = formatter.format(changes, meta, paginationResult)
 
       return {
         content: [{ type: 'text' as const, text: JSON.stringify(response, null, 2) }],

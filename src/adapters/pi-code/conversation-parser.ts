@@ -2,6 +2,7 @@ import { basename } from 'node:path'
 import { streamJsonlLines } from '../../infrastructure/file-system'
 import type { NormalizedMessage, ContentBlock, TokenUsage, MessageRole } from '../../types'
 import { extractSessionIdFromFilename } from './session-discovery'
+import { detectCorrection, isToolResultError } from '../../services/heuristics'
 
 /**
  * Pi JSONL line shapes:
@@ -85,22 +86,6 @@ interface PiThinkingBlock {
 
 type PiContentBlock = PiToolCallBlock | PiTextBlock | PiThinkingBlock | Record<string, unknown>
 
-const NEGATION_STARTS = /^(no[,.\s!]|stop[,.\s!]|don'?t\s|not that|wrong|nope|that'?s not|i said|i told you|should have|you should have)/
-const CORRECTION_KEYWORDS = /\b(wrong|don'?t|not that|i said|i told you|should have|you should have|instead of|actually no|stop being|stop doing|stop adding)\b/
-const ALL_CAPS_RE = /[A-Z]{4,}/
-
-function detectCorrection(blocks: readonly ContentBlock[]): boolean {
-  const first = blocks[0]
-  if (first?.type !== 'text' || !first.text) return false
-  const trimmed = first.text.trim()
-  if (trimmed.length === 0) return false
-  const lower = trimmed.toLowerCase()
-  if (NEGATION_STARTS.test(lower)) return true
-  if (CORRECTION_KEYWORDS.test(lower)) return true
-  if (trimmed === trimmed.toUpperCase() && ALL_CAPS_RE.test(trimmed)) return true
-  return false
-}
-
 function translateUsage(u: PiUsage | undefined): TokenUsage | undefined {
   if (!u) return undefined
   const input = u.input ?? 0
@@ -179,21 +164,31 @@ function buildToolResultBlocks(msg: PiMessage): ContentBlock[] {
       type: 'tool_result',
       tool_use_id: msg.toolCallId,
       content: stringContent,
+      // Explicit signal only (finding B1/B17) — surfaced on the block so a
+      // caller expanding a turn with several tool results can tell which
+      // one failed.
+      isError: isToolResultError({ explicitError: msg.isError === true }),
     },
   ]
 }
 
+/**
+ * Authoritative only — see services/heuristics/error-detection.ts
+ * (finding B1). Text content is never consulted.
+ */
 function detectToolResultError(msg: PiMessage): boolean {
-  if (msg.isError === true) return true
+  let text: string | undefined
   if (Array.isArray(msg.content)) {
+    const texts: string[] = []
     for (const blk of msg.content as Record<string, unknown>[]) {
       const txt = blk?.['text']
-      if (typeof txt === 'string' && /(^|\s)error\b/i.test(txt)) return true
+      if (typeof txt === 'string') texts.push(txt)
     }
+    text = texts.length > 0 ? texts.join('\n') : undefined
   } else if (typeof msg.content === 'string') {
-    if (/(^|\s)error\b/i.test(msg.content)) return true
+    text = msg.content
   }
-  return false
+  return isToolResultError({ explicitError: msg.isError === true, text })
 }
 
 function timestampStr(ts: string | number | undefined, fallback: string | undefined): string {

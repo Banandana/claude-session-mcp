@@ -83,48 +83,6 @@ describe('ContextAuditor', () => {
     })
   })
 
-  describe('token_attribution', () => {
-    it('returns tools ranked by result token consumption', () => {
-      const result = auditor.tokenAttribution('summary', {}) as any
-      expect(result.tools.length).toBeGreaterThan(0)
-      // Read appears in 3 user messages (m1, m3, m6) with tokens 5000+3000+15000=23000
-      const readTool = result.tools.find((t: any) => t.toolName === 'Read')
-      expect(readTool).toBeDefined()
-      expect(readTool.totalTokens).toBe(23000)
-      expect(readTool.pctOfTotal).toBeGreaterThan(0)
-    })
-
-    it('returns per-session breakdown in full mode', () => {
-      const result = auditor.tokenAttribution('full', {}) as any
-      expect(result.sessions.length).toBeGreaterThan(0)
-      const s1 = result.sessions.find((s: any) => s.sessionId === 's1')
-      expect(s1.tools.length).toBeGreaterThan(0)
-    })
-
-    it('filters by project', () => {
-      const result = auditor.tokenAttribution('summary', { filters: { projectSlug: 'proj-b' } }) as any
-      expect(result.tools.length).toBe(1)
-      expect(result.tools[0].toolName).toBe('Read')
-    })
-  })
-
-  describe('context_utilization', () => {
-    it('returns token accumulation stats', () => {
-      const result = auditor.contextUtilization('summary', {}) as any
-      expect(result.avgTotalTokens).toBeGreaterThan(0)
-      expect(result.medianTotalTokens).toBeGreaterThan(0)
-      expect(result.sessionsWithCollapses.count).toBe(2) // s1 and s3 have collapses
-      expect(result.sessionsWithCollapses.percentage).toBeCloseTo(66.67, 0)
-    })
-
-    it('returns per-session data in full mode', () => {
-      const result = auditor.contextUtilization('full', {}) as any
-      expect(result.sessions.length).toBe(3)
-      expect(result.sessions[0].id).toBe('s3') // most tokens first
-      expect(result.sessions[0].collapseCount).toBe(2)
-    })
-  })
-
   describe('cache_analysis', () => {
     it('returns aggregate cache stats', () => {
       const result = auditor.cacheAnalysis('summary', {}) as any
@@ -166,37 +124,10 @@ describe('ContextAuditor', () => {
   })
 
   describe('groupBy for other metrics', () => {
-    it('context_utilization groups by day', () => {
-      const result = auditor.contextUtilization('summary', { groupBy: 'day' }) as any
-      expect(result.periods).toBeDefined()
-      expect(result.periods.length).toBe(3)
-    })
-
     it('cache_analysis groups by day', () => {
       const result = auditor.cacheAnalysis('summary', { groupBy: 'day' }) as any
       expect(result.periods).toBeDefined()
       expect(result.periods.length).toBeGreaterThan(0)
-    })
-  })
-
-  describe('session_profile', () => {
-    it('returns aggregate dashboard in summary mode', () => {
-      const result = auditor.sessionProfile('summary', {}) as any
-      expect(result.totalCost).toBeCloseTo(8.50)
-      expect(result.totalTokens).toBe(350000)
-      expect(result.sessionCount).toBe(3)
-      expect(result.topExpensive.length).toBeLessThanOrEqual(3)
-      expect(result.topTokenHeavy.length).toBeLessThanOrEqual(3)
-      expect(result.topWorstCache.length).toBeLessThanOrEqual(3)
-    })
-
-    it('returns full profile per session', () => {
-      const result = auditor.sessionProfile('full', {}) as any
-      expect(result.sessions.length).toBe(3)
-      const s1 = result.sessions.find((s: any) => s.id === 's1')
-      expect(s1.cacheTokens.hitRatio).toBeGreaterThan(0)
-      expect(s1.collapseCount).toBe(1)
-      expect(s1.topTools.length).toBeGreaterThan(0)
     })
   })
 

@@ -5,14 +5,35 @@ export interface PaginatedResult<T> {
   readonly totalEstimate: number
 }
 
+/**
+ * Thrown when a cursor string fails to decode to a valid non-negative
+ * offset. Tools using `PaginationManager` should decode a caller-supplied
+ * cursor up front and turn this into a real tool error — a cursor minted by
+ * a DIFFERENT tool (or corrupted in transit) must not silently restart
+ * pagination at page 1.
+ */
+export class InvalidCursorError extends Error {
+  constructor(readonly cursor: string) {
+    super(`Invalid pagination cursor: ${cursor}`)
+    this.name = 'InvalidCursorError'
+  }
+}
+
 export class PaginationManager {
-  private readonly defaultLimit = 50
+  readonly defaultLimit = 50
 
   paginate<T>(
     items: readonly T[],
     params: { cursor?: string | undefined; limit?: number | undefined; total?: number | undefined }
   ): PaginatedResult<T> {
-    const offset = params.cursor ? this.decodeCursor(params.cursor) : 0
+    let offset = 0
+    if (params.cursor) {
+      const decoded = this.decodeCursor(params.cursor)
+      if (decoded === undefined) {
+        throw new InvalidCursorError(params.cursor)
+      }
+      offset = decoded
+    }
     const limit = params.limit ?? this.defaultLimit
     const page = items.slice(offset, offset + limit)
     // If caller supplies a real total (e.g., from a COUNT query), trust it.
@@ -36,12 +57,22 @@ export class PaginationManager {
     return Buffer.from(JSON.stringify({ o: offset })).toString('base64url')
   }
 
-  decodeCursor(cursor: string): number {
+  /**
+   * Decode a base64url `{"o":offset}` cursor. Returns `undefined` — rather
+   * than defaulting to 0 — when the cursor is malformed, so a caller can
+   * distinguish "no cursor" (start at page 1) from "garbage cursor" (an
+   * error) instead of the two collapsing into the same silent restart.
+   */
+  decodeCursor(cursor: string): number | undefined {
     try {
-      const data = JSON.parse(Buffer.from(cursor, 'base64url').toString())
-      return typeof data?.o === 'number' ? data.o : 0
+      const data: unknown = JSON.parse(Buffer.from(cursor, 'base64url').toString())
+      const offset = (data as { o?: unknown } | null)?.o
+      if (typeof offset === 'number' && Number.isFinite(offset) && offset >= 0) {
+        return offset
+      }
+      return undefined
     } catch {
-      return 0
+      return undefined
     }
   }
 }

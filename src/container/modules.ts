@@ -4,6 +4,8 @@ import { TOKENS } from './tokens'
 import { DatabaseConnection } from '../infrastructure/database'
 import { ClaudeCodeAdapter } from '../adapters/claude-code'
 import { PiCodeAdapter } from '../adapters/pi-code'
+import { CodexAdapter } from '../adapters/codex'
+import { OpencodeAdapter, defaultOpencodeDbPath } from '../adapters/opencode'
 import { AdapterRegistry } from '../services/adapter-registry'
 import { IndexManager } from '../services/index-manager'
 import { SearchIndex } from '../services/search-index'
@@ -12,7 +14,7 @@ import { TokenBudgetManager } from '../services/token-budget-manager'
 import { PaginationManager } from '../services/pagination-manager'
 
 import { LocalLlmClient } from '../services/local-llm-client'
-import { createLlmClient, OpenAiLlmClient } from '../services/llm-client'
+import { OpenAiLlmClient } from '../services/llm-client'
 import { ProjectResolver } from '../services/project-resolver'
 import { Analyzer } from '../services/analyzer'
 import { ResponseFormatter } from '../services/response-formatter'
@@ -21,7 +23,6 @@ import { PhaseClusterer } from '../services/phase-clusterer'
 import { ContextAuditor } from '../services/context-auditor'
 import { EmbeddingIndexer } from '../services/embedding-indexer'
 import { ToolInvocationLogger } from '../services/invocation-logger'
-import { AuditHistoryService } from '../services/audit-history'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 
@@ -55,13 +56,19 @@ export function registerInfrastructure(): void {
   const dbConn = new DatabaseConnection(claudeDir)
   container.bind<DatabaseConnection>(TOKENS.Database).toConstantValue(dbConn)
 
-  // Adapter & Registry
+  // Adapters & Registry. Every adapter degrades to "no sessions" when its
+  // store is absent, so registering all four is safe on a machine that only
+  // runs one agent. Each store location is overridable for testing and for
+  // non-default installs.
   const piDir = process.env['PI_AGENT_DIR'] ?? join(homedir(), '.pi', 'agent')
-  const claudeAdapter = new ClaudeCodeAdapter(claudeDir)
-  const piAdapter = new PiCodeAdapter(piDir)
+  const codexDir = process.env['CODEX_DIR'] ?? join(homedir(), '.codex')
+  const opencodeDb = process.env['OPENCODE_DB'] ?? defaultOpencodeDbPath()
+
   const registry = new AdapterRegistry()
-  registry.registerAdapter(claudeAdapter)
-  registry.registerAdapter(piAdapter)
+  registry.registerAdapter(new ClaudeCodeAdapter(claudeDir))
+  registry.registerAdapter(new PiCodeAdapter(piDir))
+  registry.registerAdapter(new CodexAdapter(codexDir))
+  registry.registerAdapter(new OpencodeAdapter(opencodeDb))
   container.bind<AdapterRegistry>(TOKENS.AdapterRegistry).toConstantValue(registry)
 
   // Index & Search — ensure schema/migrations run before services that depend on it.
@@ -79,13 +86,21 @@ export function registerInfrastructure(): void {
   const turnIndexer = new TurnIndexer(db)
   container.bind<TurnIndexer>(TOKENS.TurnIndexer).toConstantValue(turnIndexer)
 
-  // LLM clients — local only. LocalLlmClient is the legacy summarization
-  // helper used by FreshnessGuard; OpenAiLlmClient is the general-purpose
-  // backend bound under TOKENS.LlmClient for tools like deep_analyze.
-  const llmClient = new LocalLlmClient(localLlmUrl, localLlmModelFallback)
-  container.bind<LocalLlmClient>(TOKENS.LocalLlmClient).toConstantValue(llmClient)
-  const openAiLlmClient = createLlmClient(localLlmUrl, localLlmModelFallback)
-  container.bind<OpenAiLlmClient>(TOKENS.LlmClient).toConstantValue(openAiLlmClient)
+  // Background session summarization is OPT-IN via ENABLE_LLM_SUMMARIES.
+  //
+  // FreshnessGuard fires generateSummaries() on every ensureFresh() cycle, and
+  // ensureFresh() runs on every MCP tool call and every sync-timer tick. That
+  // points a steady trickle of inference at LOCAL_LLM_URL, which on a machine
+  // that also serves real workloads means competing with them for the GPU.
+  // Off by default: when the client is never constructed, the guard's
+  // `if (!this.llmClient) return` makes summarization a no-op, and nothing
+  // reaches the network.
+  const summariesEnabled = process.env['ENABLE_LLM_SUMMARIES'] === '1'
+    || process.env['ENABLE_LLM_SUMMARIES'] === 'true'
+  const llmClient = summariesEnabled
+    ? new LocalLlmClient(localLlmUrl, localLlmModelFallback)
+    : undefined
+  if (llmClient) container.bind<LocalLlmClient>(TOKENS.LocalLlmClient).toConstantValue(llmClient)
 
   // Services
   const tokenBudget = new TokenBudgetManager()
@@ -118,7 +133,7 @@ export function registerInfrastructure(): void {
   const embeddingModel = process.env['EMBEDDING_MODEL']
   let embeddingIndexer: EmbeddingIndexer | null = null
   if (embeddingModel) {
-    const embeddingDim = Number(process.env['EMBEDDING_DIM'] ?? '768')
+    const embeddingDim = Number(process.env['EMBEDDING_DIM'] ?? '1024')
     const embeddingBaseUrl = process.env['EMBEDDING_URL'] ?? localLlmUrl
     const embeddingClient = new OpenAiLlmClient(localLlmUrl, localLlmModelFallback, {
       embeddingModel,
@@ -144,9 +159,6 @@ export function registerInfrastructure(): void {
   // Tool-invocation log (V5) — schema is created via IndexManager migrations.
   const invocationLogger = new ToolInvocationLogger(db)
   container.bind<ToolInvocationLogger>(TOKENS.ToolInvocationLogger).toConstantValue(invocationLogger)
-
-  const auditHistory = new AuditHistoryService(db)
-  container.bind<AuditHistoryService>(TOKENS.AuditHistoryService).toConstantValue(auditHistory)
 }
 
 export function registerAll(): void {

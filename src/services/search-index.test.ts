@@ -191,6 +191,19 @@ describe('SearchIndex', () => {
     expect(searchIndex.searchCount('')).toBe(0)
   })
 
+  it('searchCount respects dateRange (regression: totalEstimate ignored the date filter search() used)', () => {
+    // 'database' matches msg-3 (11:00:01), msg-4 (11:00:05), and msg-5
+    // (10:05:00). Restricting to 10:30-12:00 excludes msg-5, leaving only
+    // session-2's two messages.
+    const dateRange = { from: '2026-03-28T10:30:00Z', to: '2026-03-28T12:00:00Z' }
+    const filteredResults = searchIndex.search('database', { dateRange })
+    const filteredCount = searchIndex.searchCount('database', { dateRange })
+    const unfilteredCount = searchIndex.searchCount('database')
+
+    expect(filteredCount).toBe(filteredResults.length)
+    expect(filteredCount).toBeLessThan(unfilteredCount)
+  })
+
   it('returns projectSlug in results', () => {
     const results = searchIndex.search('authentication')
     expect(results.length).toBeGreaterThan(0)
@@ -210,5 +223,45 @@ describe('SearchIndex', () => {
     expect(results.length).toBeGreaterThan(0)
     expect(results[0].role).toBe('user')
     expect(Array.isArray(results[0].toolNames)).toBe(true)
+  })
+
+  describe('source filter', () => {
+    beforeEach(() => {
+      db.prepare(`INSERT INTO sessions (id, source, project_slug, started_at) VALUES (?, ?, ?, ?)`).run(
+        'session-3', 'codex', 'project-gamma', '2026-03-28T12:00:00Z',
+      )
+      const insertMsg = db.prepare(`
+        INSERT INTO messages (id, session_id, role, type, timestamp, model, content_preview)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `)
+      const insertFts = db.prepare(`INSERT INTO messages_fts (rowid, search_text) VALUES (?, ?)`)
+      insertMsg.run('msg-6', 'session-3', 'user', 'user', '2026-03-28T12:00:01Z', null, 'Restore the database backup')
+      const row = db.prepare('SELECT rowid FROM messages WHERE id = ?').get('msg-6') as { rowid: number }
+      insertFts.run(row.rowid, 'Restore the database backup')
+    })
+
+    it('search: a single source string excludes other sources', () => {
+      const all = searchIndex.search('database')
+      const codexOnly = searchIndex.search('database', { source: 'codex' })
+
+      expect(all.some(r => r.sessionId === 'session-3')).toBe(true)
+      expect(codexOnly).toHaveLength(1)
+      expect(codexOnly[0]!.sessionId).toBe('session-3')
+    })
+
+    it('search: an array of sources is OR-matched and still excludes codex', () => {
+      const results = searchIndex.search('database', { source: ['claude-code'] })
+      expect(results.length).toBeGreaterThan(0)
+      expect(results.some(r => r.sessionId === 'session-3')).toBe(false)
+    })
+
+    it('searchCount: stays in sync with the source-filtered search() count', () => {
+      const filteredResults = searchIndex.search('database', { source: 'codex' })
+      const filteredCount = searchIndex.searchCount('database', { source: 'codex' })
+      const unfilteredCount = searchIndex.searchCount('database')
+
+      expect(filteredCount).toBe(filteredResults.length)
+      expect(filteredCount).toBeLessThan(unfilteredCount)
+    })
   })
 })

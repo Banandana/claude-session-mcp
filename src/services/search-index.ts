@@ -17,9 +17,19 @@ export interface SearchResult {
 export interface SearchOptions {
   readonly projectSlug?: string | undefined
   readonly sessionId?: string | undefined
+  /** Filter to sessions produced by one or more of these adapters (e.g. "codex", ["claude-code", "opencode"]). */
+  readonly source?: string | readonly string[] | undefined
   readonly dateRange?: DateRange | undefined
   readonly limit?: number | undefined
   readonly offset?: number | undefined
+}
+
+function sourceCondition(source: string | readonly string[] | undefined, conditions: string[], params: unknown[]): void {
+  if (!source) return
+  const sources = Array.isArray(source) ? source : [source]
+  if (sources.length === 0) return
+  conditions.push(`s.source IN (${sources.map(() => '?').join(', ')})`)
+  params.push(...sources)
 }
 
 /**
@@ -129,6 +139,8 @@ export class SearchIndex {
       params.push(options.sessionId)
     }
 
+    sourceCondition(options?.source, conditions, params)
+
     if (options?.dateRange?.from) {
       conditions.push('m.timestamp >= ?')
       params.push(options.dateRange.from)
@@ -193,7 +205,7 @@ export class SearchIndex {
     })
   }
 
-  searchCount(query: string, options?: { projectSlug?: string; sessionId?: string }): number {
+  searchCount(query: string, options?: { projectSlug?: string; sessionId?: string; source?: string | readonly string[]; dateRange?: DateRange }): number {
     if (!query.trim()) return 0
 
     const safeQuery = sanitizeFtsQuery(query)
@@ -210,6 +222,18 @@ export class SearchIndex {
     if (options?.sessionId) {
       conditions.push('m.session_id = ?')
       params.push(options.sessionId)
+    }
+
+    sourceCondition(options?.source, conditions, params)
+
+    if (options?.dateRange?.from) {
+      conditions.push('m.timestamp >= ?')
+      params.push(options.dateRange.from)
+    }
+
+    if (options?.dateRange?.to) {
+      conditions.push('m.timestamp <= ?')
+      params.push(options.dateRange.to)
     }
 
     const sql = `

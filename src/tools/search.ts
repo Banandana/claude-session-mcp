@@ -8,6 +8,9 @@ import type { ProjectResolver } from '../services/project-resolver'
 import type { PaginationManager } from '../services/pagination-manager'
 import type { ResponseFormatter } from '../services/response-formatter'
 
+/** Source adapters this server currently knows about (see docs/multi-source-plan.md). */
+const VALID_SOURCES = ['claude-code', 'pi-code', 'codex', 'opencode'] as const
+
 export function registerSearch(server: McpServer): void {
   server.tool(
     'search',
@@ -16,6 +19,9 @@ export function registerSearch(server: McpServer): void {
       query: z.string().describe('Search query (supports AND, OR, "exact phrase")'),
       project: z.string().optional().describe('Filter by project slug'),
       path: z.string().optional().describe('Resolve project from filesystem path'),
+      source: z.union([z.string(), z.array(z.string())]).optional().describe(
+        `Filter by the coding agent that produced the session. Accepts a single value or an array (OR-matched). Valid values: ${VALID_SOURCES.map(s => `"${s}"`).join(', ')}.`
+      ),
       from: z.string().optional().describe('Start date ISO 8601'),
       to: z.string().optional().describe('End date ISO 8601'),
       sessionId: z.string().optional().describe('Restrict to specific session'),
@@ -40,15 +46,29 @@ export function registerSearch(server: McpServer): void {
         ? { from: params.from, to: params.to }
         : undefined
 
+      // Decode the cursor up front and fail with a clear error on garbage
+      // input — a cursor minted by a DIFFERENT tool (or corrupted) must not
+      // silently restart search at page 1.
+      let paginationOffset = 0
+      if (params.cursor) {
+        const decoded = pagination.decodeCursor(params.cursor)
+        if (decoded === undefined) {
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify({
+              error: `Invalid pagination cursor: ${params.cursor}`,
+            }, null, 2) }],
+          }
+        }
+        paginationOffset = decoded
+      }
+
       // Pass offset + limit + 1 to SQL so pagination can detect hasMore,
       // but let the pagination layer handle actual slicing.
-      const paginationOffset = params.cursor
-        ? pagination.decodeCursor(params.cursor)
-        : 0
       const limit = params.maxResults ?? 50
       const results = searchIndex.search(params.query, {
         projectSlug,
         sessionId: params.sessionId,
+        source: params.source,
         dateRange,
         limit: paginationOffset + limit + 1,
       })
@@ -56,6 +76,8 @@ export function registerSearch(server: McpServer): void {
       const total = searchIndex.searchCount(params.query, {
         ...(projectSlug !== undefined ? { projectSlug } : {}),
         ...(params.sessionId !== undefined ? { sessionId: params.sessionId } : {}),
+        ...(params.source !== undefined ? { source: params.source } : {}),
+        ...(dateRange !== undefined ? { dateRange } : {}),
       })
 
       const page = pagination.paginate(results, {

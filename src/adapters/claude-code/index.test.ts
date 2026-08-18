@@ -147,7 +147,7 @@ describe('ClaudeCodeAdapter', () => {
   describe('checkFreshness', () => {
     it('reports all sessions as new when index is empty', async () => {
       const result = await adapter.checkFreshness({
-        sessionOffsets: new Map(),
+        sessionWatermarks: new Map(),
         lastSyncAt: new Date().toISOString(),
       })
       expect(result.isStale).toBe(true)
@@ -158,7 +158,7 @@ describe('ClaudeCodeAdapter', () => {
 
     it('reports removed sessions when index has unknown IDs', async () => {
       const result = await adapter.checkFreshness({
-        sessionOffsets: new Map([['removed-session-id', 100]]),
+        sessionWatermarks: new Map([['removed-session-id', 100]]),
         lastSyncAt: new Date().toISOString(),
       })
       expect(result.removedSessions).toContain('removed-session-id')
@@ -166,7 +166,7 @@ describe('ClaudeCodeAdapter', () => {
 
     it('reports changed sessions when offset is smaller than file size', async () => {
       const result = await adapter.checkFreshness({
-        sessionOffsets: new Map([['aaaaaaaa-1111-2222-3333-444444444444', 1]]),
+        sessionWatermarks: new Map([['aaaaaaaa-1111-2222-3333-444444444444', 1]]),
         lastSyncAt: new Date().toISOString(),
       })
       expect(result.changedSessions).toContain('aaaaaaaa-1111-2222-3333-444444444444')

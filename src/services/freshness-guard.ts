@@ -2,7 +2,7 @@ import type Database from 'better-sqlite3'
 import type { AdapterRegistry } from './adapter-registry'
 import type { IndexManager } from './index-manager'
 import type { LocalLlmClient } from './local-llm-client'
-import type { IndexState, NormalizedMessage, SessionMeta } from '../types'
+import type { FileChange, IndexState, NormalizedMessage, SessionMeta, SubagentMeta } from '../types'
 import type { TurnIndexer } from './turn-indexer'
 import type { EmbeddingIndexer } from './embedding-indexer'
 import { generateTopic } from './topic-generator'
@@ -87,11 +87,16 @@ export class FreshnessGuard {
     this.indexManager.ensureSchema()
 
     // 2. Build IndexState from current database (single query, not N+1)
-    const offsets = this.indexManager.getAllSessionOffsets()
+    const watermarks = this.indexManager.getAllSessionWatermarks()
     const known: IndexState = {
-      sessionOffsets: offsets,
+      sessionWatermarks: watermarks,
       lastSyncAt: new Date().toISOString(),
     }
+
+    // 2b. Supply DB-backed ownership hints so the registry can resolve a
+    // session's owning adapter straight from `sessions.source` instead of
+    // probing every adapter's disk layout per session (finding B11).
+    this.registry.setOwnerHints(this.loadOwnerHints())
 
     // 3. Check freshness via adapter registry
     const result = await this.registry.checkFreshness(known)
@@ -197,8 +202,8 @@ export class FreshnessGuard {
     }
 
     const insertSession = this.db.prepare(`
-      INSERT OR REPLACE INTO sessions (id, source, project_slug, cwd, branch, started_at, model, total_tokens, total_turns, summary_text, byte_offset, indexed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT OR REPLACE INTO sessions (id, source, project_slug, project_id, cwd, branch, started_at, model, total_tokens, total_turns, summary_text, byte_offset, indexed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     const insertMessage = this.db.prepare(`
@@ -231,11 +236,20 @@ export class FreshnessGuard {
 
       // Run all DB writes in a single transaction
       this.db.transaction(() => {
+        // Canonical project identity (migration V7) — resolved from cwd,
+        // additive alongside project_slug (other tool queries still use
+        // project_slug, so it's kept as-is).
+        let projectId: string | null = null
+        if (meta && meta.cwd) {
+          projectId = this.resolveProjectId(meta.cwd, meta.source, meta.projectSlug)
+        }
+
         // Insert session record
         insertSession.run(
           sessionId,
           meta?.source ?? 'claude-code',
           meta?.projectSlug ?? null,
+          projectId,
           meta?.cwd ?? null,
           meta?.branch ?? null,
           meta?.startedAt ?? null,
@@ -335,7 +349,7 @@ export class FreshnessGuard {
     }
 
     // Update offsets with real file sizes
-    await this.updateFileOffsets(sessionIds)
+    await this.updateWatermarks(sessionIds)
   }
 
   private async syncChangedSessions(sessionIds: readonly string[]): Promise<void> {
@@ -350,109 +364,134 @@ export class FreshnessGuard {
     const deleteFtsEntry = this.db.prepare(
       'DELETE FROM messages_fts WHERE rowid = ?'
     )
+    // Hoisted, matching syncNewSessions. The previous version called
+    // db.prepare() twice per message inside the loop and looked the rowid
+    // back up with a SELECT, despite the INSERT already returning it.
+    const insertFts = this.db.prepare(
+      'INSERT OR REPLACE INTO messages_fts (rowid, search_text) VALUES (?, ?)'
+    )
+    const insertFileChange = this.db.prepare(`
+      INSERT OR IGNORE INTO file_changes (session_id, message_id, file_path, operation, timestamp)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    const insertSubagent = this.db.prepare(`
+      INSERT OR IGNORE INTO subagents (id, session_id, agent_type, description, total_tokens, total_tools, duration_ms, model)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `)
+    const deleteFileChanges = this.db.prepare('DELETE FROM file_changes WHERE session_id = ?')
+    const deleteSubagents = this.db.prepare('DELETE FROM subagents WHERE session_id = ?')
+    const selectProjectSlug = this.db.prepare('SELECT project_slug FROM sessions WHERE id = ?')
+    const sumTokens = this.db.prepare('SELECT SUM(token_count) as total FROM messages WHERE session_id = ?')
+    const updateTotals = this.db.prepare('UPDATE sessions SET total_tokens = ?, total_turns = ? WHERE id = ?')
 
     for (const sessionId of sessionIds) {
-      // Delete stale FTS entries before re-inserting messages
-      const existingRowids = selectExistingRowids.all(sessionId) as Array<{ rowid: number }>
-      for (const { rowid } of existingRowids) {
-        deleteFtsEntry.run(rowid)
-      }
-
+      // Collect all async data before the transaction (same shape as
+      // syncNewSessions — better-sqlite3 transactions are synchronous, so
+      // nothing awaited may happen inside one).
       const messages: NormalizedMessage[] = []
       for await (const msg of this.registry.getMessages(sessionId)) {
         messages.push(msg)
       }
 
-      for (const msg of messages) {
-        const contentPreview = this.extractContentPreview(msg)
-        const searchText = this.extractSearchText(msg)
-        const tokenCount = msg.tokenUsage
-          ? msg.tokenUsage.input_tokens + msg.tokenUsage.output_tokens
-          : 0
-        const hasToolUse = msg.toolNames && msg.toolNames.length > 0 ? 1 : 0
-        const toolNames = msg.toolNames ? msg.toolNames.join(',') : null
+      const fileChanges: FileChange[] = []
+      for await (const change of this.registry.getFileChanges(sessionId)) {
+        fileChanges.push(change)
+      }
 
-        insertMessage.run(
-          msg.id,
-          sessionId,
-          msg.role,
-          msg.role,
-          msg.timestamp,
-          msg.model ?? null,
-          tokenCount,
-          hasToolUse,
-          toolNames,
-          msg.isError ? 1 : 0,
-          msg.isCorrection ? 1 : 0,
-          contentPreview,
-          msg.tokenUsage?.cache_creation_input_tokens ?? 0,
-          msg.tokenUsage?.cache_read_input_tokens ?? 0,
-          msg.hasThinking ? 1 : 0,
-          searchText,
-        )
+      const subagents: SubagentMeta[] = []
+      for await (const agent of this.registry.getSubagents(sessionId)) {
+        subagents.push(agent)
+      }
 
-        if (searchText) {
-          const row = this.db.prepare('SELECT rowid FROM messages WHERE id = ?').get(msg.id) as { rowid: number } | undefined
-          if (row) {
-            this.db.prepare('INSERT OR REPLACE INTO messages_fts (rowid, search_text) VALUES (?, ?)').run(row.rowid, searchText)
+      // Run all DB writes in a single transaction. Previously each of the
+      // thousands of inserts committed on its own, which on a long session
+      // dominated the re-sync.
+      this.db.transaction(() => {
+        // Delete stale FTS entries before re-inserting messages
+        const existingRowids = selectExistingRowids.all(sessionId) as Array<{ rowid: number }>
+        for (const { rowid } of existingRowids) {
+          deleteFtsEntry.run(rowid)
+        }
+
+        for (const msg of messages) {
+          const contentPreview = this.extractContentPreview(msg)
+          const searchText = this.extractSearchText(msg)
+          const tokenCount = msg.tokenUsage
+            ? msg.tokenUsage.input_tokens + msg.tokenUsage.output_tokens
+            : 0
+          const hasToolUse = msg.toolNames && msg.toolNames.length > 0 ? 1 : 0
+          const toolNames = msg.toolNames ? msg.toolNames.join(',') : null
+
+          const result = insertMessage.run(
+            msg.id,
+            sessionId,
+            msg.role,
+            msg.role,
+            msg.timestamp,
+            msg.model ?? null,
+            tokenCount,
+            hasToolUse,
+            toolNames,
+            msg.isError ? 1 : 0,
+            msg.isCorrection ? 1 : 0,
+            contentPreview,
+            msg.tokenUsage?.cache_creation_input_tokens ?? 0,
+            msg.tokenUsage?.cache_read_input_tokens ?? 0,
+            msg.hasThinking ? 1 : 0,
+            searchText,
+          )
+
+          if (searchText && result.lastInsertRowid) {
+            insertFts.run(result.lastInsertRowid, searchText)
           }
         }
-      }
 
-      // Aggregate token counts
-      const tokenRow = this.db.prepare(
-        'SELECT SUM(token_count) as total FROM messages WHERE session_id = ?'
-      ).get(sessionId) as { total: number | null } | undefined
-      if (tokenRow?.total) {
-        this.db.prepare('UPDATE sessions SET total_tokens = ?, total_turns = ? WHERE id = ?')
-          .run(tokenRow.total, messages.length, sessionId)
-      }
+        // Aggregate token counts
+        const tokenRow = sumTokens.get(sessionId) as { total: number | null } | undefined
+        if (tokenRow?.total) {
+          updateTotals.run(tokenRow.total, messages.length, sessionId)
+        }
 
-      // Re-index file changes
-      this.db.prepare('DELETE FROM file_changes WHERE session_id = ?').run(sessionId)
-      const insertFileChange = this.db.prepare(`
-        INSERT OR IGNORE INTO file_changes (session_id, message_id, file_path, operation, timestamp)
-        VALUES (?, ?, ?, ?, ?)
-      `)
-      for await (const change of this.registry.getFileChanges(sessionId)) {
-        insertFileChange.run(
-          sessionId,
-          change.messageId ?? null,
-          change.filePath,
-          change.operation,
-          change.timestamp,
-        )
-      }
+        // Re-index file changes
+        deleteFileChanges.run(sessionId)
+        for (const change of fileChanges) {
+          insertFileChange.run(
+            sessionId,
+            change.messageId ?? null,
+            change.filePath,
+            change.operation,
+            change.timestamp,
+          )
+        }
 
-      // Re-index subagents
-      this.db.prepare('DELETE FROM subagents WHERE session_id = ?').run(sessionId)
-      const insertSubagent = this.db.prepare(`
-        INSERT OR IGNORE INTO subagents (id, session_id, agent_type, description, total_tokens, total_tools, duration_ms, model)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      for await (const agent of this.registry.getSubagents(sessionId)) {
-        insertSubagent.run(
-          agent.id,
-          sessionId,
-          agent.agentType ?? null,
-          agent.description ?? null,
-          agent.totalTokens ?? null,
-          agent.totalTools ?? null,
-          agent.durationMs ?? null,
-          agent.model ?? null,
-        )
-      }
+        // Re-index subagents
+        deleteSubagents.run(sessionId)
+        for (const agent of subagents) {
+          insertSubagent.run(
+            agent.id,
+            sessionId,
+            agent.agentType ?? null,
+            agent.description ?? null,
+            agent.totalTokens ?? null,
+            agent.totalTools ?? null,
+            agent.durationMs ?? null,
+            agent.model ?? null,
+          )
+        }
 
-      // Compute and store session metrics + metadata
-      this.computeSessionMetrics(sessionId, messages)
-      const projectSlug = this.db.prepare('SELECT project_slug FROM sessions WHERE id = ?').get(sessionId) as { project_slug: string | null } | undefined
+        this.computeSessionMetrics(sessionId, messages)
+
+        // Index turn events for structured queries
+        this.turnIndexer?.indexSession(sessionId, messages)
+      })()
+
+      // Metadata sync is async (fetches cost data) — must be outside the
+      // transaction, same as syncNewSessions.
+      const projectSlug = selectProjectSlug.get(sessionId) as { project_slug: string | null } | undefined
       await this.syncSessionMetadata(sessionId, projectSlug?.project_slug ?? undefined)
-
-      // Index turn events for structured queries
-      this.turnIndexer?.indexSession(sessionId, messages)
     }
 
-    await this.updateFileOffsets(sessionIds)
+    await this.updateWatermarks(sessionIds)
   }
 
   private removeDeletedSessions(sessionIds: readonly string[]): void {
@@ -489,11 +528,29 @@ export class FreshnessGuard {
   }
 
   private computeSessionMetrics(sessionId: string, messages?: readonly NormalizedMessage[]): void {
-    // Get started_at from session row
+    // A source whose format has no failure channel must not report 0 errors —
+    // that reads as "this agent never fails" in cross-source comparisons.
+    // NULL says "not observable here", which is the truth. See
+    // ErrorSignalSupport in types/adapter.ts.
+    const sourceRow = this.db.prepare(
+      'SELECT source FROM sessions WHERE id = ?'
+    ).get(sessionId) as { source: string | null } | undefined
+    const errorsObservable = sourceRow?.source
+      ? this.registry.errorSignalForSource(sourceRow.source) === 'explicit'
+      : true
+    // Get started_at (+ the fields needed to resolve project_id) from session row
     const sessionRow = this.db.prepare(
-      'SELECT started_at FROM sessions WHERE id = ?'
-    ).get(sessionId) as { started_at: string | null } | undefined
+      'SELECT started_at, source, project_slug, cwd, project_id FROM sessions WHERE id = ?'
+    ).get(sessionId) as { started_at: string | null; source: string; project_slug: string | null; cwd: string | null; project_id: string | null } | undefined
     const startedAt = sessionRow?.started_at ?? null
+
+    // Populate project_id (migration V7) whenever it's still unset — covers
+    // syncChangedSessions, which doesn't have a fresh SessionMeta to hand
+    // to the insert path the way syncNewSessions does.
+    if (sessionRow && sessionRow.cwd && !sessionRow.project_id) {
+      const projectId = this.resolveProjectId(sessionRow.cwd, sessionRow.source, sessionRow.project_slug ?? '')
+      this.db.prepare('UPDATE sessions SET project_id = ? WHERE id = ?').run(projectId, sessionId)
+    }
 
     // Message counts
     const msgStats = this.db.prepare(`
@@ -601,7 +658,7 @@ export class FreshnessGuard {
       endedAt,
       durationMinutes,
       messageCount,
-      msgStats.error_count,
+      errorsObservable ? msgStats.error_count : null,
       msgStats.correction_count,
       saRow.cnt,
       JSON.stringify(toolCounts),
@@ -741,15 +798,46 @@ export class FreshnessGuard {
     return parts.join('\n')
   }
 
-  private async updateFileOffsets(sessionIds: readonly string[]): Promise<void> {
+  private async updateWatermarks(sessionIds: readonly string[]): Promise<void> {
     // Delegate to the registry — each adapter owns its on-disk layout.
     // (Claude-code: ~/.claude/projects/<slug>/<id>.jsonl. Pi-code: ~/.pi/agent/sessions/...).
-    // Without this, pi-code sessions stay at offset 0 and get re-indexed every cycle.
+    // Without this, pi-code sessions stay at watermark 0 and get re-indexed every cycle.
     for (const sessionId of sessionIds) {
-      const size = await this.registry.getSessionSize(sessionId)
-      if (size !== undefined) {
-        this.indexManager.updateSessionOffset(sessionId, size)
+      const watermark = await this.registry.getSessionWatermark(sessionId)
+      if (watermark !== undefined) {
+        this.indexManager.updateSessionWatermark(sessionId, watermark)
       }
     }
+  }
+
+  /** One `SELECT id, source FROM sessions` per cycle — see finding B11. */
+  private loadOwnerHints(): Map<string, string> {
+    const rows = this.db.prepare('SELECT id, source FROM sessions').all() as Array<{ id: string; source: string }>
+    const hints = new Map<string, string>()
+    for (const row of rows) hints.set(row.id, row.source)
+    return hints
+  }
+
+  /**
+   * Resolves (and lazily creates) the canonical project row for a
+   * session's real filesystem cwd, and records the (source, slug) ->
+   * project_id alias (migration V7 — canonical project identity).
+   *
+   * The canonical id IS the normalized path: stable across sources, since
+   * a claude slug (-home-kitty-foo), a pi slug (--home-kitty-foo--), an
+   * opencode sha1, and a bare Codex cwd can all describe the same
+   * directory and should collapse to the same project.
+   */
+  private resolveProjectId(cwd: string, source: string, sourceSlug: string): string {
+    const projectId = cwd.length > 1 && cwd.endsWith('/') ? cwd.slice(0, -1) : cwd
+    this.db.prepare(
+      'INSERT OR IGNORE INTO projects (id, path, first_seen_at) VALUES (?, ?, ?)'
+    ).run(projectId, projectId, new Date().toISOString())
+    if (sourceSlug) {
+      this.db.prepare(
+        'INSERT OR IGNORE INTO project_aliases (source, source_slug, project_id) VALUES (?, ?, ?)'
+      ).run(source, sourceSlug, projectId)
+    }
+    return projectId
   }
 }

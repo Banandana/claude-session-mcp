@@ -1,6 +1,7 @@
 import { basename } from 'node:path'
 import { streamJsonlLines } from '../../infrastructure/file-system'
 import type { NormalizedMessage, ContentBlock, TokenUsage, MessageRole } from '../../types'
+import { detectCorrection, isToolResultError } from '../../services/heuristics'
 
 /** JSONL line types that should be skipped entirely. */
 const SKIP_TYPES = new Set(['file-history-snapshot', 'queue-operation', 'progress'])
@@ -102,55 +103,33 @@ function normalizeContentBlock(raw: Record<string, unknown>): ContentBlock {
   if (raw['type'] === 'tool_result') {
     block['tool_use_id'] = raw['tool_use_id']
     block['content'] = raw['content']
-    if (raw['is_error']) block['content'] = raw['content']
+    // Explicit signal only (finding B1/B17) — surfaced per-block so a caller
+    // expanding a turn with several tool results can tell which one failed.
+    block['isError'] = isToolResultError({ explicitError: raw['is_error'] === true })
   }
   return block as unknown as ContentBlock
 }
 
-const NEGATION_STARTS = /^(no[,.\s!]|stop[,.\s!]|don'?t\s|not that|wrong|nope|that'?s not|i said|i told you|should have|you should have)/
-const CORRECTION_KEYWORDS = /\b(wrong|don'?t|not that|i said|i told you|should have|you should have|instead of|actually no|stop being|stop doing|stop adding)\b/
-const ALL_CAPS_RE = /[A-Z]{4,}/
-
-/** Heuristic: is this user text message a correction of the preceding assistant turn? */
-function detectCorrection(contentBlocks: readonly ContentBlock[]): boolean {
-  const firstBlock = contentBlocks[0]
-  if (firstBlock?.type !== 'text' || !firstBlock.text) return false
-
-  const text = firstBlock.text.trim().toLowerCase()
-  if (text.length === 0) return false
-
-  // Pattern 1: Starts with negation/redirection
-  if (NEGATION_STARTS.test(text)) return true
-
-  // Pattern 2: Correction keywords anywhere in message
-  if (CORRECTION_KEYWORDS.test(text)) return true
-
-  // Pattern 3: ALL CAPS messages with 4+ consecutive caps (anger/emphasis)
-  const original = firstBlock.text.trim()
-  if (original === original.toUpperCase() && ALL_CAPS_RE.test(original)) {
-    return true
-  }
-
-  return false
-}
-
+/**
+ * Message-level rollup: true if ANY tool_result block in this user turn
+ * carries an explicit error signal. Authoritative only — see
+ * services/heuristics/error-detection.ts (finding B1).
+ */
 function detectToolResultError(line: RawJsonlLine): boolean {
   const content = line.message?.content
   if (!Array.isArray(content)) return false
   for (const block of content) {
-    if (block.type === 'tool_result') {
-      // Explicit is_error flag
-      if (block.is_error === true) return true
-      // Check toolUseResult-style content
-      const result = block.content
-      if (typeof result === 'string' && /error/i.test(result)) return true
-      if (result && typeof result === 'object' && !Array.isArray(result)) {
-        if ((result as Record<string, unknown>)['stderr'] &&
-            String((result as Record<string, unknown>)['stderr']).trim().length > 0) {
-          return true
-        }
-      }
+    if (block.type !== 'tool_result') continue
+    const result = block.content
+    const stderr = result && typeof result === 'object' && !Array.isArray(result)
+      ? (result as Record<string, unknown>)['stderr']
+      : undefined
+    const signal = {
+      explicitError: block.is_error === true,
+      text: typeof result === 'string' ? result : undefined,
+      stderr: typeof stderr === 'string' ? stderr : undefined,
     }
+    if (isToolResultError(signal)) return true
   }
   return false
 }

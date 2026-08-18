@@ -5,21 +5,6 @@ import { TOKENS } from '../container/tokens'
 import type { FreshnessGuard } from '../services/freshness-guard'
 import type { ResponseFormatter } from '../services/response-formatter'
 import type { DatabaseConnection } from '../infrastructure/database'
-import type { OpenAiLlmClient } from '../services/llm-client'
-
-function formatTopTools(json: string): string {
-  try {
-    const counts = JSON.parse(json) as Record<string, number>
-    return Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([n, c]) => `${n}(${c})`).join(', ')
-  } catch { return '' }
-}
-
-function formatFiles(json: string): string {
-  try {
-    const files = JSON.parse(json) as Array<{ path: string; op: string }>
-    return files.slice(0, 5).map(f => `${f.path} (${f.op})`).join(', ')
-  } catch { return '' }
-}
 
 const SECTION_NAMES = [
   'metadata',
@@ -70,7 +55,6 @@ export function registerGetSession(server: McpServer): void {
       sessionId: z.string().describe('Session ID (UUID)'),
       detail: z.enum(['summary', 'metadata', 'full']).optional().describe('Detail level preset'),
       sections: z.array(z.enum(SECTION_NAMES)).optional().describe('Explicit section list — overrides detail. Sections: metadata, toolCounts, filesChanged, cacheTokens, tokenAccumulation, prLinks, subagents, contextCollapses, tokenCurve. Base summary fields are always returned.'),
-      intent: z.string().max(500).optional().describe('Free-text analysis intent — triggers live LLM analysis (requires detail=full or sections)'),
     },
     async (params) => {
       const freshnessGuard = container.get<FreshnessGuard>(TOKENS.FreshnessGuard)
@@ -273,22 +257,33 @@ export function registerGetSession(server: McpServer): void {
         // Token accumulation curve — one entry per message. Opt-in only
         // because long sessions produce hundreds of entries.
         const msgs = db.prepare(
-          'SELECT token_count FROM messages WHERE session_id = ? ORDER BY timestamp'
-        ).all(params.sessionId) as Array<{ token_count: number }>
+          'SELECT id, token_count FROM messages WHERE session_id = ? ORDER BY timestamp'
+        ).all(params.sessionId) as Array<{ id: string; token_count: number }>
 
-        // Interpolate collapse positions evenly across the session
-        const collapseCountForCurve = db.prepare(
-          'SELECT COUNT(*) as cnt FROM context_collapses WHERE session_id = ?'
-        ).get(params.sessionId) as { cnt: number }
+        // Resolve real collapse positions from the stored anchors instead of
+        // guessing. Each collapse's position is its last_archived_uuid — the
+        // final message swept into that collapse — falling back to
+        // first_archived_uuid only when last is absent; both are real
+        // stored anchors, never an interpolated guess. A collapse whose
+        // anchor uuid doesn't match any message in this session is omitted
+        // entirely rather than placed at a fabricated index.
+        const collapseAnchors = db.prepare(
+          'SELECT first_archived_uuid, last_archived_uuid FROM context_collapses WHERE session_id = ?'
+        ).all(params.sessionId) as Array<{
+          first_archived_uuid: string | null
+          last_archived_uuid: string | null
+        }>
+
+        const messageIndexByUuid = new Map(msgs.map((m, i) => [m.id, i]))
+        const collapsePositions = new Set<number>()
+        for (const anchor of collapseAnchors) {
+          const anchorUuid = anchor.last_archived_uuid ?? anchor.first_archived_uuid
+          if (!anchorUuid) continue
+          const idx = messageIndexByUuid.get(anchorUuid)
+          if (idx !== undefined) collapsePositions.add(idx)
+        }
 
         let cumulative = 0
-        const totalMsgs = msgs.length
-        const collapsePositions = new Set(
-          Array.from({ length: collapseCountForCurve.cnt }, (_, i) =>
-            Math.round((totalMsgs / (collapseCountForCurve.cnt + 1)) * (i + 1))
-          )
-        )
-
         result['tokenCurve'] = msgs.map((m, i) => {
           cumulative += m.token_count
           return {
@@ -297,45 +292,6 @@ export function registerGetSession(server: McpServer): void {
             isCollapse: collapsePositions.has(i),
           }
         })
-      }
-
-      if (detail === 'full' || (params.sections && params.sections.length > 0)) {
-        // Intent-based LLM analysis
-        if (params.intent) {
-          try {
-            const messageCount = session.message_count ?? session.total_turns ?? 0
-
-            if (messageCount >= 3) {
-              const llmClient = container.get<OpenAiLlmClient>(TOKENS.LlmClient)
-              const available = await llmClient.isAvailable()
-              if (available) {
-                const metricsBlock = [
-                  `Duration: ${session.duration_minutes ?? 0} min, ${session.total_turns ?? 0} turns`,
-                  `Errors: ${session.error_count ?? 0}, Corrections: ${session.correction_count ?? 0}`,
-                  session.tool_counts ? `Tools: ${formatTopTools(session.tool_counts)}` : null,
-                  session.files_changed ? `Files: ${formatFiles(session.files_changed)}` : null,
-                ].filter(Boolean).join('\n')
-
-                const systemPrompt = 'You are analyzing a coding session for a specific purpose. Answer: 1. Is this session relevant to the caller\'s intent? (yes/no) 2. If relevant, explain specifically how. 3. If not, say what the session was actually about in one sentence. Be concise.'
-                const userContent = `Caller's intent: ${params.intent}\n\nSession metrics:\n${metricsBlock}`
-
-                const llmResponse = await llmClient.analyze(systemPrompt, userContent, 300)
-                const relevant = !llmResponse.toLowerCase().startsWith('no')
-                result['analysis'] = {
-                  relevant,
-                  summary: llmResponse,
-                  generatedAt: new Date().toISOString(),
-                }
-              } else {
-                result['analysis'] = null
-              }
-            } else {
-              result['analysis'] = { relevant: false, summary: 'Too few messages for analysis', reason: 'too_few_messages' }
-            }
-          } catch {
-            result['analysis'] = null
-          }
-        }
       }
 
       const meta = formatter.formatMeta(freshness)

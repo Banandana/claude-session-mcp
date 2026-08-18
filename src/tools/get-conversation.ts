@@ -8,10 +8,7 @@ import type { DatabaseConnection } from '../infrastructure/database'
 import type { PhaseClusterer, Phase } from '../services/phase-clusterer'
 import type { AdapterRegistry } from '../services/adapter-registry'
 import type { NormalizedMessage } from '../types'
-
-function validateSessionId(id: string): boolean {
-  return /^[a-f0-9-]{32,40}$/i.test(id)
-}
+import { isValidSessionId } from './shared/session-id'
 
 interface SessionRow {
   readonly project_slug: string | null
@@ -54,7 +51,7 @@ export function registerGetConversation(server: McpServer): void {
 
       const freshness = await freshnessGuard.ensureFresh()
 
-      if (!validateSessionId(params.sessionId)) {
+      if (!isValidSessionId(params.sessionId)) {
         return {
           content: [{ type: 'text' as const, text: JSON.stringify({ error: `Invalid session ID format: ${params.sessionId}` }, null, 2) }],
         }
